@@ -1,0 +1,65 @@
+# Recipe: MiniMax-M2.7-NVFP
+# MiniMax M2.7 model with NVFP quantization
+
+recipe_version: "1"
+name: MiniMax-M2.7-NVFP
+description: vLLM serving MiniMax-M2.7-NVFP (no ray)
+
+model: nvidia/MiniMax-M2.7-NVFP
+
+# Container image to use
+container: vllm-node-tf5-stable
+
+build_args: 
+  - --tf5
+
+# Can only be run in a cluster
+cluster_only: true
+
+# No mods required
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 30000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.88
+  max_model_len: 163840
+  dtype: auto
+  kv_cache_dtype: auto
+  max_num_seqs: 4
+  max_num_batched_tokens: 16384
+  eth-if: enp1s0f0np0
+  ib-if: rocep1s0f0,roceP2p1s0f0
+  nccl-debug: INFO 
+
+# Environment variables
+env:
+   NCCL_DEBUG_SUBSYS: INIT,ENV,NET,GRAPH
+   TORCH_DISTRIBUTED_DEBUG: DETAIL 
+   VLLM_FLOAT32_MATMUL_PRECISION: high 
+   VLLM_FLASHINFER_MOE_BACKEND: throughput 
+   OMP_NUM_THREADS: 10 
+   MKL_NUM_THREADS: 10 
+
+command: |
+  vllm serve nvidia/MiniMax-M2.7-NVFP4 \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --dtype {dtype} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --load-format fastsafetensors \
+      --enable-prefix-caching\
+      --attention-backend flashinfer\
+      --moe-backend flashinfer_cutlass\
+      --quantization modelopt_fp4\
+      -O3 \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2
