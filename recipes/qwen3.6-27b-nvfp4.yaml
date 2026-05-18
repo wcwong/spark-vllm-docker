@@ -23,6 +23,7 @@ defaults:
   kv_cache_dtype: auto
 
 env:
+  NCCL_DEBUG_SUBSYS: INIT,ENV,NET,GRAPH
   VLLM_FLOAT32_MATMUL_PRECISION: high 
   TORCH_MATMUL_PRECISION: high
   OMP_NUM_THREADS: 10 
