@@ -14,7 +14,7 @@ defaults:
   port: 30000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.80
+  gpu_memory_utilization: 0.85
   max_model_len: 262144
   max_num_batched_tokens: 32768
   max_num_seqs: 3
@@ -48,7 +48,7 @@ command: |
    --generation-config vllm \
    --default-chat-template-kwargs '{{"enable_thinking":true,"preserve_thinking":true}}' \
    --override-generation-config '{{"temperature":0.6,"top_p":0.95,"top_k":20, "presence_penalty":0.0,"repetition_penalty":1.0}}' \
-   --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.6-27B-DFlash", "num_speculative_tokens": 7}}' \
+   --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.6-27B-DFlash", "num_speculative_tokens": 15}}' \
    --attention-backend flash_attn
 
 
