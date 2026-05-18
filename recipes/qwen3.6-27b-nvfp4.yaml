@@ -15,7 +15,7 @@ defaults:
   host: 0.0.0.0
   tensor_parallel: 2
 # allocating more memory doesn't give enough space for the autotune to fp4_gemm autotuner to finish.
-  gpu_memory_utilization: 0.86
+  gpu_memory_utilization: 0.85
   max_model_len: 262144
   max_num_batched_tokens: 32768
   max_num_seqs: 3
