@@ -33,6 +33,7 @@ command: |
   vllm serve unsloth/Qwen3.6-27B-NVFP4 \
    -O3 \
    --host {host} --port {port} \
+   --cudagraph-metrics --enable-mfu-metrics \
    -tp {tensor_parallel} \
    --max-model-len {max_model_len} \
    --max-num-batched-tokens {max_num_batched_tokens} \
