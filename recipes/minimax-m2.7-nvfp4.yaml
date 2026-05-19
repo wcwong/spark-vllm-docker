@@ -27,9 +27,9 @@ defaults:
   gpu_memory_utilization: 0.88
   max_model_len: 163840
   dtype: auto
-  kv_cache_dtype: auto
-  max_num_seqs: 4
-  max_num_batched_tokens: 16384
+  kv_cache_dtype: fp8 
+  max_num_seqs: 12
+  max_num_batched_tokens: 32768
   eth-if: enp1s0f0np0
   ib-if: rocep1s0f0,roceP2p1s0f0
   nccl-debug: INFO 
@@ -42,11 +42,15 @@ env:
    VLLM_FLASHINFER_MOE_BACKEND: throughput 
    OMP_NUM_THREADS: 10 
    MKL_NUM_THREADS: 10 
+   SAFETENSORS_FAST_GPU: 1
+   VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+   VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
 
 command: |
   vllm serve nvidia/MiniMax-M2.7-NVFP4 \
       --port {port} \
       --host {host} \
+      --cudagraph-metrics --enable-mfu-metrics \
       --gpu-memory-utilization {gpu_memory_utilization} \
       -tp {tensor_parallel} \
       --max-model-len {max_model_len} \
@@ -54,11 +58,12 @@ command: |
       --max-num-batched-tokens {max_num_batched_tokens} \
       --dtype {dtype} \
       --kv-cache-dtype {kv_cache_dtype} \
-      --load-format fastsafetensors \
-      --enable-prefix-caching\
-      --attention-backend flashinfer\
-      --moe-backend flashinfer_cutlass\
-      --quantization modelopt_fp4\
+      --load-format safetensors \
+      --safetensors-load-strategy lazy \
+      --enable-prefix-caching \
+      --attention-backend flashinfer \
+      --moe-backend flashinfer_cutlass \
+      --quantization modelopt_fp4 \
       -O3 \
       --enable-auto-tool-choice \
       --tool-call-parser minimax_m2 \
