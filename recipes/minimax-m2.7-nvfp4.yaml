@@ -28,7 +28,7 @@ defaults:
   max_model_len: 163840
   dtype: auto
   kv_cache_dtype: fp8 
-  max_num_seqs: 12
+  max_num_seqs: 4
   max_num_batched_tokens: 32768
   eth-if: enp1s0f0np0
   ib-if: rocep1s0f0,roceP2p1s0f0
@@ -58,8 +58,7 @@ command: |
       --max-num-batched-tokens {max_num_batched_tokens} \
       --dtype {dtype} \
       --kv-cache-dtype {kv_cache_dtype} \
-      --load-format safetensors \
-      --safetensors-load-strategy lazy \
+      --load-format fastsafetensors \
       --enable-prefix-caching \
       --attention-backend flashinfer \
       --moe-backend flashinfer_cutlass \
