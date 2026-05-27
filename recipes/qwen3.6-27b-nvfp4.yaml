@@ -14,13 +14,27 @@ defaults:
   port: 30000
   host: 0.0.0.0
   tensor_parallel: 2
-# allocating more memory doesn't give enough space for the autotune to fp4_gemm autotuner to finish.
-  gpu_memory_utilization: 0.85
+  # allocating more memory doesn't give enough space for the autotune to fp4_gemm autotuner to finish.
+  gpu_memory_utilization: 0.75
   max_model_len: 262144
   max_num_batched_tokens: 32768
-  max_num_seqs: 3
+  max_num_seqs: 4
   dtype: bfloat16
   kv_cache_dtype: auto
+  #model load currently fails with nvfp4
+#  kv_cache_dtype: nvfp4
+
+# b12x added in https://github.com/vllm-project/vllm/pull/40082
+#  linear_backend: flashinfer-b12x
+  linear_backend: flashinfer_cutlass
+#   attention_backend: flashinfer
+  attention_backend: flash_attn
+
+# cutedsl and flashinfer is not supported yet b/c of head_k_dim
+# falling back to Triton/FLA.(requested=flashinfer, head_k_dim=None).
+#  gdn_prefill_backend: cutedsl
+#  gdn_prefill_backend: flashinfer
+  gdn_prefill_backend: cutedsl
 
 env:
   NCCL_DEBUG_SUBSYS: INIT,ENV,NET,GRAPH
@@ -28,6 +42,9 @@ env:
   TORCH_MATMUL_PRECISION: high
   OMP_NUM_THREADS: 10 
   MKL_NUM_THREADS: 10 
+  CUTE_DSL_ARCH: sm_121a 
+  # use flashinfer instead of nccl all reduce
+  VLLM_ALLREDUCE_USE_FLASHINFER: 1  
 
 command: |
   vllm serve unsloth/Qwen3.6-27B-NVFP4 \
@@ -51,10 +68,15 @@ command: |
    --generation-config vllm \
    --default-chat-template-kwargs '{{"enable_thinking":true,"preserve_thinking":true}}' \
    --override-generation-config '{{"temperature":0.6,"top_p":0.95,"top_k":20, "presence_penalty":0.0,"repetition_penalty":1.0}}' \
-   --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.6-27B-DFlash", "num_speculative_tokens": 17}}' \
-   --attention-backend flash_attn
+   --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.6-27B-DFlash", "num_speculative_tokens": 11}}' \
+   --max-cudagraph-capture-size 128 \
+   --linear-backend {linear_backend} \
+   --attention-backend {attention_backend} \
+   --gdn-prefill-backend {gdn_prefill_backend}
 
-
-
-
+#  quantization: auto
+#    --quantization {quantization} \
+#
+# not applicable for world=2
+#    --all2all-backend flashinfer_nvlink_one_sided \
 
