@@ -5,37 +5,35 @@ recipe_version: "1"
 name: Step-3.7-Flash-NVFP4
 description: vLLM serving Step-3.7-Flash-NVFP4 on two Sparks
 
-# HuggingFace model to download (optional, for --download-model)
 model: stepfun-ai/Step-3.7-Flash-NVFP4
 
-# Container image to use
 container: vllm-node
 
-# Can only be run in a cluster
 cluster_only: true
 
-# No mods required
 mods:
   - mods/step-3.7-flash
+  - mods/drop-caches
 
 # Default settings (can be overridden via CLI)
 defaults:
   port: 30000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.8
+  gpu_memory_utilization: 0.9
   max_model_len: 262144
   max_num_batched_tokens: 32768
-  dtype: auto
+  max_num_seqs: 4
+  dtype: bfloat16
   quantization: modelopt_fp4
-  moe_backend: cutlass
+  moe_backend: auto
   linear_backend: flashinfer_cutlass
   attention_backend: flashinfer
-#  attention_backend: flash_attn
   gdn_prefill_backend: cutedsl
 
-
-# Environment variables
+# still doesn't work
+#   linear_backend: flashinfer-b12x
+  
 env:
   NCCL_DEBUG_SUBSYS: INIT,ENV,NET,GRAPH
   VLLM_FLOAT32_MATMUL_PRECISION: high 
@@ -44,10 +42,16 @@ env:
   MKL_NUM_THREADS: 10 
   CUTE_DSL_ARCH: sm_121a 
 
-# The vLLM serve command template
+# try these out at some point
+#  TORCH_CUDA_ARCH_LIST: 12.1a
+#  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+
+
 command: |
   vllm serve stepfun-ai/Step-3.7-Flash-NVFP4 \
       --trust-remote-code \
+      --disable-cascade-attn \
+      --enable-expert-parallel \
       --cudagraph-metrics --enable-mfu-metrics \
       --port {port} \
       --host {host} \
@@ -55,17 +59,16 @@ command: |
       -tp {tensor_parallel} \
       --dtype {dtype} \
       --max-model-len {max_model_len} \
+      --enable-chunked-prefill \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
       --enable-auto-tool-choice \
       --reasoning-parser step3p5 \
       --tool-call-parser step3p5 \
       --load-format instanttensor \
       --quantization {quantization} \
+      --enable-flashinfer-autotune \
       --linear-backend {linear_backend} \
       --attention-backend {attention_backend} \
       --gdn-prefill-backend {gdn_prefill_backend} \
       --moe-backend {moe_backend}
-
-
-#   linear_backend: flashinfer-b12x
-#  gdn_prefill_backend: flashinfer
-
