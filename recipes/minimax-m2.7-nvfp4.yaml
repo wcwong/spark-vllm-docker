@@ -24,15 +24,17 @@ defaults:
   port: 30000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.88
-  max_model_len: 163840
+  gpu_memory_utilization: 0.80
+  max_model_len: 16384
   dtype: auto
   kv_cache_dtype: fp8 
-  max_num_seqs: 4
-  max_num_batched_tokens: 32768
+  max_num_seqs: 1
+  max_num_batched_tokens: 4096
   eth-if: enp1s0f0np0
   ib-if: rocep1s0f0,roceP2p1s0f0
   nccl-debug: INFO 
+  moe_backend: flashinfer_b12x
+# moe_backend: flashinfer_cutlass
 
 # Environment variables
 env:
@@ -45,6 +47,8 @@ env:
    SAFETENSORS_FAST_GPU: 1
    VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
    VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+   VLLM_ALLREDUCE_USE_FLASHINFER: 1
+   CUTE_DSL_ARCH: sm_121a
 
 command: |
   vllm serve nvidia/MiniMax-M2.7-NVFP4 \
@@ -61,7 +65,7 @@ command: |
       --load-format fastsafetensors \
       --enable-prefix-caching \
       --attention-backend flashinfer \
-      --moe-backend flashinfer_cutlass \
+      --moe-backend {moe_backend} \
       --quantization modelopt_fp4 \
       -O3 \
       --enable-auto-tool-choice \
