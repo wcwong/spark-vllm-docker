@@ -142,6 +142,77 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-06-10
+
+#### DiffusionGemma Recipes and Mod
+
+Added day0 support for Google DeepMind's DiffusionGemma model via `mods/diffusiongemma`. Check out [NVIDIA blog](https://developer.nvidia.com/blog/run-diffusiongemma-on-nvidia-for-developer-ready-high-throughput-text-generation/) for details!
+
+Added four solo-only DiffusionGemma recipes:
+
+- `diffusion-gemma-bf16-thinking` for `google/diffusiongemma-26B-A4B-it` with thinking enabled.
+- `diffusion-gemma-bf16` for `google/diffusiongemma-26B-A4B-it` with thinking disabled.
+- `diffusion-gemma-nvfp4-thinking` for `nvidia/diffusiongemma-26B-A4B-it-NVFP4` with thinking enabled.
+- `diffusion-gemma-nvfp4` for `nvidia/diffusiongemma-26B-A4B-it-NVFP4` with thinking disabled.
+
+The non-thinking variants still keep `--reasoning-parser gemma4`, since these models can emit Gemma4 channel markers even when thinking is disabled.
+
+Example:
+
+```bash
+./hf-download.sh google/diffusiongemma-26B-A4B-it
+./run-recipe.sh diffusion-gemma-bf16-thinking --solo
+```
+
+#### `run-recipe.sh` Launch Flag Passthrough
+
+`run-recipe.sh` now passes additional `launch-cluster.sh` flags through when running recipes:
+`--apply-mod`, `-p` / `--publish`, and `--keep-entrypoint`.
+
+Port publishing is still solo-only, matching `launch-cluster.sh` behavior.
+
+### 2026-06-09
+
+#### Recipe Memory Defaults
+
+Raised the default `gpu_memory_utilization` from `0.7` to `0.8` across the main single-node and two-node recipes to match the current vLLM memory allocation behavior.
+
+### 2026-06-07
+
+#### Docker Base Image Compatibility
+
+The default CUDA base image was changed to `nvidia/cuda:13.0.2-devel-ubuntu24.04` for broader host compatibility.
+
+The Dockerfile also now passes `--allow-change-held-packages` when installing the custom NCCL Debian packages, avoiding apt failures when replacing held CUDA/NCCL packages during image builds.
+
+### 2026-06-06
+
+#### MiniMax Multi-Node Regression Workaround
+
+Added a targeted Dockerfile patch that disables the MiniMax QK RMSNorm CUDA IPC fused path introduced by vLLM PR #43410. The fused path can fail when tensor parallelism spans DGX Spark nodes; the workaround preserves MiniMax multi-node TP while avoiding a full upstream revert.
+
+### 2026-06-03
+
+#### Solo Port Publishing
+
+`launch-cluster.sh` now supports Docker-style `-p` / `--publish` port mappings in solo mode. When port publishing is used, the launcher switches from host networking to Docker bridge networking for that solo container.
+
+Example:
+
+```bash
+./launch-cluster.sh --solo -p 8000:8000 exec vllm serve ...
+```
+
+### 2026-05-29
+
+#### Wheel Freshness Detection
+
+Improved `build-and-copy.sh` wheel freshness checks so newer locally built wheels are not overwritten just because their filenames differ from the latest release assets. The script now compares local wheel mtimes against remote release asset timestamps before deciding to download. Also switched from using GitHub API to regular HTTP checks to avoid throttling.
+
+#### `gpu-mem-util-gb` Patch Refresh
+
+Refreshed `mods/gpu-mem-util-gb` so it applies against newer vLLM `CacheConfig` code after upstream line/context drift.
+
 ### 2026-05-28
 
 #### StepFun Step 3.7 Flash Support
@@ -198,6 +269,10 @@ Use it with official vLLM images before starting the model:
   --apply-mod mods/use-official-vllm \
   exec vllm serve ...
 ```
+
+#### Torch Pinning During Wheel Install
+
+Pinned the already-installed CUDA torch build via `uv --override` when installing locally built wheels and final runtime dependencies in both Dockerfiles. This prevents transitive dependencies from re-resolving torch to a CPU wheel during image builds.
 
 ### 2026-05-22
 
@@ -720,6 +795,12 @@ Example:
 
 # Run with overrides
 ./run-recipe.sh glm-4.7-flash-awq --solo --port 9000 --gpu-mem 0.8
+
+# Apply an extra launch-cluster mod on top of recipe mods
+./run-recipe.sh glm-4.7-flash-awq --solo --apply-mod mods/use-official-vllm
+
+# Publish ports in solo mode
+./run-recipe.sh glm-4.7-flash-awq --solo -p 8000:8000
 
 # Cluster deployment
 ./run-recipe.sh glm-4.7-nvfp4 --setup
@@ -1386,7 +1467,7 @@ The new shell inherits the container environment, including NCCL, Ray, and vLLM 
 
 ## 5\. Mods and Patches
 
-The vLLM Docker setup supports applying custom mods and patches to address specific model compatibility issues or apply experimental features. This functionality is primarily managed through the `--apply-mod` option in the cluster launch script.
+The vLLM Docker setup supports applying custom mods and patches to address specific model compatibility issues or apply experimental features. This functionality is primarily managed through the `--apply-mod` option in the cluster launch script, and `run-recipe.sh` can pass additional `--apply-mod` flags through to `launch-cluster.sh`.
 
 ### Available Mods
 
@@ -1399,6 +1480,7 @@ The repository includes several pre-configured mods in the `mods/` directory:
 - **fix-qwen3-coder-next/**: Qwen3-Coder-Next runtime and performance fixes.
 - **gpu-mem-util-gb/**: Adds experimental `--gpu-memory-utilization-gb` support.
 - **drop-caches/**: Periodically clears filesystem caches for large models running near the memory limit.
+- **diffusiongemma/**: Adds DiffusionGemma support, dynamic causal attention compatibility, and Gemma4 reasoning/content-channel fixes used by the DiffusionGemma recipes.
 - **nemotron-nano/** and **nemotron-super/**: Nemotron reasoning parser and model support helpers.
 - **exp-b12x/**: Experimental FlashInfer b12x support for builds that include the required upstream vLLM support.
 - **use-official-vllm/**: Installs `git` inside official vLLM containers (Ubuntu/Debian-based) so that other mods that rely on `git apply` work correctly, and redirects the pip-installed NCCL library to the system `libnccl2` library to avoid DGX Spark multi-node NCCL hangs. Apply this mod first when using official vLLM images (e.g. `vllm-openai`).
@@ -1421,6 +1503,12 @@ You can apply multiple mods by specifying additional `--apply-mod` flags:
 
 ```bash
 ./launch-cluster.sh --apply-mod ./mods/fix-Salyut1-GLM-4.7-NVFP4 --apply-mod ./mods/other-mod
+```
+
+When using recipes, any mods listed in the recipe are applied first, followed by mods supplied on the command line:
+
+```bash
+./run-recipe.sh glm-4.7-flash-awq --solo --apply-mod ./mods/other-mod
 ```
 
 ### Creating Custom Mods
