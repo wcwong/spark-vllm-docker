@@ -1,0 +1,58 @@
+# Recipe: Cohere North Code Mini 1.0
+#
+
+recipe_version: "1"
+name: 
+description: vLLM serving Cohere North Code Mini 1.0 
+
+model: CohereLabs/North-Mini-Code-1.0
+
+container: vllm-node
+
+solo_only: true
+
+mods:
+  - mods/drop-caches
+  - mods/cohere
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 30000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.9
+  max_model_len: 320000
+  max_num_batched_tokens: 32768
+  max_num_seqs: 4
+  dtype: bfloat16
+  gdn_prefill_backend: cutedsl
+
+env:
+  VLLM_FLOAT32_MATMUL_PRECISION: high 
+  TORCH_MATMUL_PRECISION: high
+  OMP_NUM_THREADS: 10 
+  MKL_NUM_THREADS: 10 
+  CUTE_DSL_ARCH: sm_121a 
+  CUDA_SCALE_LAUNCH_QUEUES: 4x
+
+command: |
+  vllm serve CohereLabs/North-Mini-Code-1.0 \
+      --cudagraph-metrics --enable-mfu-metrics \
+      -O3 \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --dtype {dtype} \
+      --tool-call-parser cohere_command4 \
+      --reasoning-parser cohere_command4 \
+      --enable-auto-tool-choice \
+      --enable-flashinfer-autotune \
+      --enable-chunked-prefill \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --load-format instanttensor
+
+#       --attention-backend flashinfer \
+#      --chat-template chat_template.jinja \
+#      --gdn-prefill-backend {gdn_prefill_backend}
