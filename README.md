@@ -142,6 +142,32 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-06-22
+
+#### Deepseek V4 Flash support
+
+Support and a recipe for Deepseek V4 Flash has been added based on a newly merged vLLM PR. Please note that this PR requires the DeepGEMM `nv_dev` branch, which is not present in default vLLM builds, but included in this community build.
+
+To run DSV4F you will need a Spark cluster (2 or more nodes).
+
+To run:
+
+```bash
+git pull
+./build-and-copy.sh -c
+./hf-download.sh deepseek-ai/DeepSeek-V4-Flash -c
+./run-recipe.sh deepseek-v4-flash --no-ray
+```
+
+#### DeepGEMM support added
+
+vLLM now uses NVIDIA branch for DeepGEMM that includes support for sm12x GPU family, including DGX Spark.
+Please note that it is currently not compatible with NVRTC compiler, so `DG_JIT_USE_NVRTC` has been turned off for new builds.
+
+#### MiniMax AWQ Weight-Shape Loader Workaround
+
+Added a Dockerfile-level workaround for a vLLM nightly regression where compressed-tensors MoE `weight_shape` metadata is treated as a scalar during load, causing affected MoE quantized models to fail with `shape '[]' is invalid for input of size 2`.
+
 ### 2026-06-18
 
 #### KV Cache Preallocation Cleanup Mod & Updated Qwen3.5-397B recipe for dual Sparks
@@ -781,6 +807,7 @@ Added `--gpu-arch <arch>` flag to `build-and-copy.sh`. This allows specifying th
 - `~/.cache/vllm`
 - `~/.cache/flashinfer`
 - `~/.triton`
+- `~/.tilelang`
 
 To disable this behavior (clean start), use `--no-cache-dirs` flag.
 
@@ -840,7 +867,7 @@ Thanks @raphaelamorim for the contribution!
 
 `./build-and-copy.sh` now supports ability to apply vLLM PRs to builds. PR is applied to the most recent vLLM commit (or specific vllm-ref if set). This does NOT apply to wheels build and MXFP4 special build!
 
-To use, just specify `--apply-vllm-pr <pr_num>` in the arguments. Please note that it may fail depending on whether the PR needs a rebase for the specified vLLM reference/main branch. Use with caution!
+To use, just specify `--apply-vllm-pr <pr_num>` in the arguments. When custom vLLM PRs are specified, Dockerfile preset vLLM PRs are skipped unless `--apply-preset-vllm-prs` is also specified. Please note that it may fail depending on whether the PR needs a rebase for the specified vLLM reference/main branch. Use with caution!
 
 Example:
 
@@ -1231,6 +1258,7 @@ Using a different username:
 | `--vllm-ref <ref>` | vLLM commit SHA, branch or tag (default: `main`) |
 | `--flashinfer-ref <ref>` | FlashInfer commit SHA, branch or tag (default: `main`) |
 | `--apply-vllm-pr <pr-num>` | Apply a vLLM PR patch during build. Can be specified multiple times. |
+| `--apply-preset-vllm-prs` | Also apply Dockerfile preset vLLM PRs when `--apply-vllm-pr` is specified. |
 | `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
 | `--tf5` | Install transformers v5 (5.0.0 or higher). Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
@@ -1288,7 +1316,7 @@ Assumptions and limitations:
 - It assumes that the same physical interfaces are named the same on all nodes (IOW, enp1s0f1np1 refers to the same physical port on all nodes). If it's not the case, you will have to launch cluster nodes manually or modify the script.
 - It clears the Docker image entrypoint by default so images that define an entrypoint, such as `vllm-openai`, can still start as idle cluster containers before commands are executed. Use `--keep-entrypoint` to keep the image entrypoint.
 - In solo mode, `-p` / `--publish` can be used to publish ports in Docker format, for example `-p 8000:8000`. When port publishing is used, the launcher does not use host networking. Port publishing is not supported in cluster mode.
-- It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, and `~/.triton` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/Triton cache mounts. Add any other mounts with the `VLLM_SPARK_EXTRA_DOCKER_ARGS` environment variable, e.g. `VLLM_SPARK_EXTRA_DOCKER_ARGS="-v $HOME/my-data:/data" ./launch-cluster.sh ...`. Use `$HOME` instead of `~` because `~` will not expand when passed through the variable to Docker arguments.
+- It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/Triton/TileLang cache mounts. Add any other mounts with the `VLLM_SPARK_EXTRA_DOCKER_ARGS` environment variable, e.g. `VLLM_SPARK_EXTRA_DOCKER_ARGS="-v $HOME/my-data:/data" ./launch-cluster.sh ...`. Use `$HOME` instead of `~` because `~` will not expand when passed through the variable to Docker arguments.
 
 
 **Start in daemon mode (background):**
@@ -1349,7 +1377,7 @@ You can override the auto-detected values if needed:
 | `-p, --publish` | Publish a container port in Docker format, for example `-p 8000:8000`. Solo mode only; replaces host networking. Can be used multiple times. |
 | `--no-ray` | No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend). |
 | `--master-port` / `--head-port` | Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501). |
-| `--no-cache-dirs` | Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton). |
+| `--no-cache-dirs` | Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton, ~/.tilelang). |
 | `--keep-entrypoint` | Keep the Docker image entrypoint instead of clearing it before launching the idle cluster container. |
 | `--launch-script` | Path to bash script to execute in the container (from examples/ directory or absolute path). If launch script is specified, action should be omitted. |
 | `-d` | Run in daemon mode (detached). |

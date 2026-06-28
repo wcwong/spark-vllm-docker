@@ -15,7 +15,8 @@ ENV MAX_JOBS=${BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 ENV NINJAFLAGS="-j${BUILD_JOBS}"
 ENV MAKEFLAGS="-j${BUILD_JOBS}"
-ENV DG_JIT_USE_NVRTC=1
+# disable for conflicts with DeepGEMM
+ENV DG_JIT_USE_NVRTC=0
 ENV USE_CUDNN=1
 
 # Set non-interactive frontend to prevent apt prompts
@@ -102,6 +103,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    echo "CACHEBUST_FLASHINFER=${CACHEBUST_FLASHINFER}" && \
     cd /repo-cache && \
     if [ ! -d "flashinfer" ]; then \
         echo "Cache miss: Cloning FlashInfer from scratch..." && \
@@ -126,7 +128,8 @@ WORKDIR /workspace/flashinfer
 
 ARG FLASHINFER_PRS=""
 
-RUN if [ -n "$FLASHINFER_PRS" ]; then \
+RUN set -eux; \
+    if [ -n "$FLASHINFER_PRS" ]; then \
         # Git requires a user identity to create merge commits
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
@@ -134,8 +137,20 @@ RUN if [ -n "$FLASHINFER_PRS" ]; then \
         echo "Applying PRs: $FLASHINFER_PRS"; \
         for pr in $FLASHINFER_PRS; do \
             echo "Fetching and merging PR #$pr..."; \
-            git fetch origin pull/${pr}/head:pr-${pr}; \
-            git merge pr-${pr} --no-edit; \
+            git fetch origin +pull/${pr}/head:pr-${pr}; \
+            if git merge-base --is-ancestor pr-${pr} HEAD; then \
+                echo "PR #$pr is already contained in HEAD; skipping."; \
+            else \
+                cherry_file="/tmp/pr-${pr}.cherry"; \
+                git cherry HEAD pr-${pr} > "$cherry_file"; \
+                if ! grep -q '^+' "$cherry_file"; then \
+                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
+                    rm -f "$cherry_file"; \
+                    continue; \
+                fi; \
+                rm -f "$cherry_file"; \
+                git merge pr-${pr} --no-edit; \
+            fi; \
         done; \
     fi
 
@@ -187,8 +202,14 @@ ARG CACHEBUST_VLLM=1
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
+# DeepGEMM nv_dev includes SM120/SM121 MXFP4 support from PR #324.
+ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_REF=nv_dev
+ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
+
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    echo "CACHEBUST_VLLM=${CACHEBUST_VLLM}" && \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
@@ -209,22 +230,113 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     fi && \
     cp -a /repo-cache/vllm $VLLM_BASE_DIR/
 
+RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    set -eux; \
+    cd /repo-cache; \
+    if [ ! -d "deepgemm" ]; then \
+        echo "Cache miss: Cloning DeepGEMM from scratch..."; \
+        git clone --recursive "$DEEPGEMM_REPO" deepgemm; \
+    else \
+        echo "Cache hit: Fetching DeepGEMM updates..."; \
+        cd deepgemm; \
+        git fetch origin; \
+        git fetch origin --tags --force; \
+        cd ..; \
+    fi; \
+    cd deepgemm; \
+    git checkout --detach "$DEEPGEMM_REF" 2>/dev/null || git checkout --detach "origin/$DEEPGEMM_REF"; \
+    git reset --hard; \
+    git submodule update --init --recursive; \
+    git clean -fdx; \
+    rm -rf "$DEEPGEMM_SRC_DIR"; \
+    cp -a /repo-cache/deepgemm "$DEEPGEMM_SRC_DIR"
+
 WORKDIR $VLLM_BASE_DIR/vllm
 
+ARG VLLM_PRESET_PRS=""
+ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
-RUN if [ -n "$VLLM_PRS" ]; then \
+RUN set -eux; \
+    VLLM_ALL_PRS=""; \
+    VLLM_SELECTED_PRESET_PRS=""; \
+    case "$VLLM_APPLY_PRESET_PRS" in \
+        1|true|TRUE|yes|YES) VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS";; \
+        0|false|FALSE|no|NO) VLLM_SELECTED_PRESET_PRS="";; \
+        ""|auto|AUTO) \
+            if [ -z "$VLLM_PRS" ]; then \
+                VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; \
+            fi;; \
+        *) echo "Invalid VLLM_APPLY_PRESET_PRS value: $VLLM_APPLY_PRESET_PRS"; exit 1;; \
+    esac; \
+    for pr in $VLLM_SELECTED_PRESET_PRS $VLLM_PRS; do \
+        case " $VLLM_ALL_PRS " in \
+            *" $pr "*) ;; \
+            *) VLLM_ALL_PRS="${VLLM_ALL_PRS:+$VLLM_ALL_PRS }$pr";; \
+        esac; \
+    done; \
+    if [ -n "$VLLM_ALL_PRS" ]; then \
         # Git requires a user identity to create merge commits
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
-        echo "Applying PRs: $VLLM_PRS"; \
-        for pr in $VLLM_PRS; do \
+        echo "Applying PRs: $VLLM_ALL_PRS"; \
+        for pr in $VLLM_ALL_PRS; do \
             echo "Fetching and merging PR #$pr..."; \
-            git fetch origin pull/${pr}/head:pr-${pr}; \
-            git merge pr-${pr} --no-edit; \
+            git fetch origin +pull/${pr}/head:pr-${pr}; \
+            if git merge-base --is-ancestor pr-${pr} HEAD; then \
+                echo "PR #$pr is already contained in HEAD; skipping."; \
+            else \
+                cherry_file="/tmp/pr-${pr}.cherry"; \
+                git cherry HEAD pr-${pr} > "$cherry_file"; \
+                if ! grep -q '^+' "$cherry_file"; then \
+                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
+                    rm -f "$cherry_file"; \
+                    continue; \
+                fi; \
+                rm -f "$cherry_file"; \
+                git merge pr-${pr} --no-edit; \
+            fi; \
         done; \
     fi
+
+# TEMPORARY PATCH (source build only): vLLM PR #43008 selects cooperative_topk
+# for all SM90+ devices. On DGX Spark / SM12.x this fails at launch with
+# "cooperative_topk launch failed: invalid argument". Keep the cooperative
+# path on SM90 and let newer architectures use the existing persistent_topk fallback.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/model_executor/layers/sparse_attn_indexer.py")
+old = '''        use_cooperative_topk = (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 1024, 2048)
+            and num_rows <= 32
+            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+            and current_platform.has_device_capability(90)
+        )'''
+new = '''        device_capability = current_platform.get_device_capability()
+        use_cooperative_topk = (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 1024, 2048)
+            and num_rows <= 32
+            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+            and device_capability is not None
+            and device_capability.to_int() == 90
+        )'''
+
+if not target.exists():
+    print(f"{target} not found; skipping SM120 cooperative_topk workaround")
+else:
+    text = target.read_text()
+    if "device_capability.to_int() == 90" in text:
+        print("SM120 cooperative_topk workaround already present; skipping")
+    elif old in text:
+        target.write_text(text.replace(old, new, 1))
+        print("Applied SM120 cooperative_topk workaround")
+    else:
+        print("Known cooperative_topk selector pattern not found; skipping")
+PY
 
 # TEMPORARY PATCH: vLLM PR #43409 started passing AutoGPTQ MoE qzeros
 # through even for symmetric GPTQ. On CUDA Marlin MoE this can select the
@@ -307,6 +419,50 @@ RUN set -eux; \
         exit 1; \
     fi
 
+# TEMPORARY PATCH: vLLM PR #43362 made RoutedExperts scalarize all
+# _load_single_value() inputs. That is correct for scalar input scales, but
+# compressed-tensors MoE checkpoints also load 2-element weight_shape metadata
+# through this path. Preserve vector metadata when the destination slot matches.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/model_executor/layers/fused_moe/routed_experts.py")
+old = '''    def _load_single_value(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
+    ):
+        param_data = param.data
+
+        # Input scales can be loaded directly and should be equal.
+        param_data[expert_id] = self._to_scalar(loaded_weight)
+'''
+new = '''    def _load_single_value(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
+    ):
+        param_data = param.data
+        target = param_data[expert_id]
+
+        if target.ndim > 0 and target.numel() == loaded_weight.numel():
+            target.copy_(loaded_weight.reshape_as(target).to(
+                device=target.device, dtype=target.dtype))
+            return
+
+        # Scalar input scales can be loaded directly and should be equal.
+        param_data[expert_id] = self._to_scalar(loaded_weight)
+'''
+
+if not target.exists():
+    print(f"{target} not found; skipping RoutedExperts weight_shape workaround")
+else:
+    text = target.read_text()
+    if "target = param_data[expert_id]" in text:
+        print("RoutedExperts weight_shape workaround already present; skipping")
+    elif old in text:
+        target.write_text(text.replace(old, new, 1))
+        print("Applied RoutedExperts weight_shape workaround")
+    else:
+        print("Known vulnerable RoutedExperts _load_single_value pattern not found; skipping")
+PY
+
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
@@ -332,7 +488,8 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref in the wheels dir
-    git rev-parse HEAD > /workspace/wheels/.vllm-commit
+    git rev-parse HEAD > /workspace/wheels/.vllm-commit && \
+    git -C "$DEEPGEMM_SRC_DIR" rev-parse HEAD > /workspace/wheels/.deepgemm-commit
 
 # =========================================================
 # STAGE 5: vLLM Wheel Export
@@ -352,7 +509,8 @@ ENV MAX_JOBS=${BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 ENV NINJAFLAGS="-j${BUILD_JOBS}"
 ENV MAKEFLAGS="-j${BUILD_JOBS}"
-ENV DG_JIT_USE_NVRTC=1
+# For compatibility with DeepGEMM changes
+ENV DG_JIT_USE_NVRTC=0
 ENV USE_CUDNN=1
 
 ENV DEBIAN_FRONTEND=noninteractive
