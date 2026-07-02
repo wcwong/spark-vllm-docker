@@ -12,10 +12,7 @@ model: Qwen/Qwen3.5-397B-A17B-FP8
 #solo_only: true
 
 # Container image to use
-container: vllm-node-tf5
-
-build_args:
-  - --tf5
+container: vllm-node
 
 # Mod required to fix ROPE syntax error
 mods:

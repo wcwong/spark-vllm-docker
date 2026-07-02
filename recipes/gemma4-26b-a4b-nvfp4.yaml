@@ -1,19 +1,20 @@
 # Recipe: Gemma4-26B-A4B
-# Gemma4-26B-A4B model in online FP8 quantization
-
+# Gemma4-26B-A4B model in NVFP4 quantization
 recipe_version: "1"
-name: Gemma4-26B-A4B
-description: vLLM serving Gemma4-26B-A4B
+name: Gemma4-26B-A4B-NVFP4
+description: vLLM serving Gemma4-26B-A4B-NVFP4
 
 # HuggingFace model to download (optional, for --download-model)
-model: google/gemma-4-26B-A4B-it
+model: nvidia/Gemma-4-26B-A4B-NVFP4
 
-# Only cluster is supported
+# Only solo is supported
 cluster_only: false
-solo_only: false
+solo_only: true
 
 # Container image to use
 container: vllm-node
+
+# No legacy TF5 build_args needed; vLLM uses Transformers v5 by default.
 
 # Mods
 # mods:
@@ -24,7 +25,7 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.8
+  gpu_memory_utilization: 0.7
   max_model_len: 262144
   max_num_batched_tokens: 8192
 
@@ -33,18 +34,18 @@ env: {}
 
 # The vLLM serve command template
 command: |
-  vllm serve google/gemma-4-26B-A4B-it  \
+  vllm serve nvidia/Gemma-4-26B-A4B-NVFP4  \
     --max-model-len {max_model_len} \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --port {port} \
     --host {host} \
-    --load-format safetensors \
+    --load-format instanttensor \
     --enable-prefix-caching \
     --enable-auto-tool-choice \
     --tool-call-parser gemma4 \
     --reasoning-parser gemma4 \
-    --quantization fp8 \
     --kv-cache-dtype fp8 \
     --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative-config '{{"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4, "moe_backend": "triton"}}' \
     -tp {tensor_parallel} --distributed-executor-backend ray
     

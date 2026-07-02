@@ -11,10 +11,7 @@ model: Intel/Qwen3.5-122B-A10B-int4-AutoRound
 #solo_only: true
 
 # Container image to use
-container: vllm-node-tf5
-
-build_args:
-  - --tf5
+container: vllm-node
 
 # Mod required to fix ROPE syntax error
 mods:

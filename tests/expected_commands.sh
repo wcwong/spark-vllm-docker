@@ -12,7 +12,7 @@
 # README Reference: Lines 186-198 (solo) and 203-218 (cluster)
 # ==============================================================================
 GLM_FLASH_AWQ_MODEL="cyankiwi/GLM-4.7-Flash-AWQ-4bit"
-GLM_FLASH_AWQ_CONTAINER="vllm-node-tf5"
+GLM_FLASH_AWQ_CONTAINER="vllm-node"
 GLM_FLASH_AWQ_MOD="mods/fix-glm-4.7-flash-AWQ"
 GLM_FLASH_AWQ_ARGS=(
     "--tool-call-parser glm47"

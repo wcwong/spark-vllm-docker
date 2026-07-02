@@ -419,7 +419,7 @@ Both flags are incompatible with `--exp-mxfp4`.
 
 `build-and-copy.sh` now automatically sets a sensible default image tag when `-t` is not specified:
 
-- `--tf5` / `--pre-tf` - tag defaults to `vllm-node-tf5`
+- `--tf5` / `--pre-tf` - deprecated compatibility flag; normal build, tag defaults to `vllm-node-tf5`
 - `--exp-mxfp4` - tag defaults to `vllm-node-mxfp4`
 - in all other cases - tag defaults to `vllm-node` (no change)
 
@@ -949,17 +949,17 @@ At this point it doesn't seem like NGC container performs any better for this mo
 Added a mod to prevent severe inference speed degradation when using cyankiwi/GLM-4.7-Flash-AWQ-4bit (and potentially other AWQ quants of this model).
 See (this post on NVIDIA forums)[https://forums.developer.nvidia.com/t/make-glm-4-7-flash-go-brrrrr/359111] for implementation details.
 
-To use the mod, first build the container with Transformers 5 support (`--pre-tf`) flag, e.g.:
+Build the standard image first:
 
 ```bash
-# Image tag defaults to vllm-node-tf5 when --tf5/--pre-tf is used
-./build-and-copy.sh --pre-tf -c
+# Standard image tag defaults to vllm-node
+./build-and-copy.sh -c
 ```
 
 Then, to run on a single node:
 
 ```bash
-./launch-cluster.sh -t vllm-node-tf5 --solo \
+./launch-cluster.sh -t vllm-node --solo \
   --apply-mod mods/fix-glm-4.7-flash-AWQ \
   exec vllm serve cyankiwi/GLM-4.7-Flash-AWQ-4bit \
   --tool-call-parser glm47 \
@@ -976,7 +976,7 @@ Then, to run on a single node:
 To run on cluster:
 
 ```bash
-./launch-cluster.sh -t vllm-node-tf5 \
+./launch-cluster.sh -t vllm-node \
   --apply-mod mods/fix-glm-4.7-flash-AWQ \
   exec vllm serve cyankiwi/GLM-4.7-Flash-AWQ-4bit \
   --tool-call-parser glm47 \
@@ -1094,7 +1094,7 @@ exec vllm serve Salyut1/GLM-4.7-NVFP4 \
 
 ### 2025-12-21
 
-- Added `--pre-tf` / `--pre-transformers` flag to `build-and-copy.sh` to install pre-release transformers (5.0.0rc or higher). Use it if you need to run GLM 4.6V or any other model that requires transformers 5.0. It may cause issues with other models, so you may want to stick to the release version for everything else.
+- Added `--pre-tf` / `--pre-transformers` flag to `build-and-copy.sh` for early Transformers 5 testing. Historical note: this flag is now deprecated; current builds use the vLLM default Transformers dependency and the flag only preserves legacy inputs/tagging.
 - Pre-built wheels now support release versions. Use with `--use-wheels release`.
 - Using nightly wheels or building from source is recommended for better performance.
 
@@ -1260,7 +1260,7 @@ Using a different username:
 | `--apply-vllm-pr <pr-num>` | Apply a vLLM PR patch during build. Can be specified multiple times. |
 | `--apply-preset-vllm-prs` | Also apply Dockerfile preset vLLM PRs when `--apply-vllm-pr` is specified. |
 | `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
-| `--tf5` | Install transformers v5 (5.0.0 or higher). Aliases: `--pre-tf, --pre-transformers`. |
+| `--tf5` | Deprecated compatibility flag; performs a normal build but keeps the legacy `vllm-node-tf5` default tag. Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
 | `-c, --copy-to <hosts>` | Host(s) to copy the image to after building (space- or comma-separated). |
 | `--copy-to-host` | Alias for `--copy-to` (backwards compatibility). |
