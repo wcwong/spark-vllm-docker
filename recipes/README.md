@@ -141,7 +141,7 @@ The `build_args` field passes flags to `build-and-copy.sh`:
 | Flag | Description |
 |------|-------------|
 | `--exp-mxfp4` | Use MXFP4 Dockerfile (for MXFP4 quantized models) |
-| `--use-wheels` | Use pre-built wheels instead of building from source |
+| `--use-wheels` | Build the runner image from prebuilt or local wheels instead of pulling `eugr/spark-vllm:latest` |
 
 ### Parameter Substitution
 
@@ -189,7 +189,8 @@ Setup options:
 
 Launch options:
   --solo                      Run in solo mode (single node, no Ray)
-  --no-ray                    Multi-node without Ray (PyTorch distributed backend)
+  --ray                       Opt into Ray for multi-node vLLM
+  --no-ray                    Default multi-node no-Ray mode (accepted for compatibility)
   -n, --nodes IPS             Comma-separated node IPs (first = head)
   -d, --daemon                Run in daemon mode
   -t, --container IMAGE       Override container from recipe
@@ -207,6 +208,8 @@ Launch options:
   -j N                        Number of parallel build jobs
   --no-cache-dirs             Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton
   --keep-entrypoint           Keep the Docker image entrypoint
+  --earlyoom                  Run earlyoom as the container foreground process
+  --earlyoom-args ARGS        Arguments passed to earlyoom
   --non-privileged            Run container without --privileged
   --mem-limit-gb N            Memory limit in GB (only with --non-privileged)
   --mem-swap-limit-gb N       Memory+swap limit in GB (only with --non-privileged)
@@ -219,6 +222,13 @@ Extra vLLM arguments:
 Other:
   --dry-run                   Show what would be executed
   --list, -l                  List available recipes
+```
+
+`--earlyoom` uses the same optional monitor as `launch-cluster.sh`. The default arguments are `-M 524288,102400 -s 100 -r 60`; override them with `--earlyoom-args "..."` or `VLLM_SPARK_EARLYOOM_ARGS`. `-M` values are KiB, so the default sends SIGTERM below 512 MiB available memory and SIGKILL below 100 MiB. For example:
+
+```bash
+./run-recipe.sh minimax-m2-awq --solo \
+  --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120"
 ```
 
 ## Extra vLLM Arguments

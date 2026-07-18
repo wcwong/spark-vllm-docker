@@ -3,6 +3,7 @@
 # Limit build parallelism to reduce OOM situations
 ARG BUILD_JOBS=16
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
+ARG NCCL_NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
 
 # =========================================================
 # STAGE 1: Base Build Image
@@ -69,6 +70,7 @@ ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
 # 2. Set Environment Variables
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ARG NCCL_NVCC_GENCODE
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 # Setup Workspace
@@ -76,11 +78,11 @@ WORKDIR $VLLM_BASE_DIR
 
 # Build NCCL with mesh support (TODO: only do it if arch is 12.1) - artifacts will be in /workspace/nccl/build/pkg/deb
 # RUN git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git && \
-#     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
+#     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="${NCCL_NVCC_GENCODE}" && \
 #     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
 
 RUN git clone https://github.com/NVIDIA/nccl.git && \
-    cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
+    cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="${NCCL_NVCC_GENCODE}" && \
     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./build/pkg/deb/*.deb
 
 # =========================================================
@@ -118,6 +120,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${FLASHINFER_REF} 2>/dev/null || git checkout ${FLASHINFER_REF}) && \
+        git reset --hard HEAD && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -128,31 +131,112 @@ WORKDIR /workspace/flashinfer
 
 ARG FLASHINFER_PRS=""
 
+# PR refs include the branch history they were developed on. Use upstream main
+# only to identify each PR's patch range, then apply that patch to FLASHINFER_REF.
 RUN set -eux; \
+    FLASHINFER_REQUESTED_HEAD="$(git rev-parse HEAD)"; \
     if [ -n "$FLASHINFER_PRS" ]; then \
-        # Git requires a user identity to create merge commits
+        # cp -a preserves the source repository's index stat data, but the copied
+        # files have different filesystem identities. Refresh before --index apply.
+        git update-index --refresh; \
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
-        echo "Applying PRs: $FLASHINFER_PRS"; \
+        echo "Applying PR patches to FlashInfer ref $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD): $FLASHINFER_PRS"; \
+        echo "Fetching origin/main only to calculate PR patch ranges; current checkout remains $FLASHINFER_REF."; \
+        git fetch origin +refs/heads/main:refs/remotes/origin/main; \
         for pr in $FLASHINFER_PRS; do \
-            echo "Fetching and merging PR #$pr..."; \
+            echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
-            if git merge-base --is-ancestor pr-${pr} HEAD; then \
-                echo "PR #$pr is already contained in HEAD; skipping."; \
-            else \
-                cherry_file="/tmp/pr-${pr}.cherry"; \
-                git cherry HEAD pr-${pr} > "$cherry_file"; \
-                if ! grep -q '^+' "$cherry_file"; then \
-                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
-                    rm -f "$cherry_file"; \
-                    continue; \
+            pr_base="$(git merge-base origin/main pr-${pr} || true)"; \
+            if [ -z "$pr_base" ]; then \
+                echo "Unable to find an origin/main merge-base for FlashInfer PR #$pr."; \
+                exit 1; \
+            fi; \
+            patch_file="/tmp/flashinfer-pr-${pr}.patch"; \
+            echo "FlashInfer PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
+            git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
+            if [ ! -s "$patch_file" ]; then \
+                echo "FlashInfer PR #$pr has no patch relative to origin/main; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --reverse --check --binary "$patch_file" >/dev/null 2>&1; then \
+                echo "FlashInfer PR #$pr patch is already applied to HEAD; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --3way --index --binary "$patch_file"; then \
+                if git diff --cached --quiet; then \
+                    echo "FlashInfer PR #$pr patch produced no staged changes; skipping."; \
+                else \
+                    git commit -m "Apply FlashInfer PR #${pr}"; \
                 fi; \
-                rm -f "$cherry_file"; \
-                git merge pr-${pr} --no-edit; \
+                rm -f "$patch_file"; \
+            else \
+                conflict_files="$(git diff --name-only --diff-filter=U)"; \
+                if [ -n "$conflict_files" ]; then \
+                    echo "FlashInfer PR #$pr has patch conflicts: $conflict_files"; \
+                else \
+                    echo "FlashInfer PR #$pr patch failed without unmerged files."; \
+                fi; \
+                rm -f "$patch_file"; \
+                git reset --hard HEAD; \
+                exit 1; \
             fi; \
         done; \
+        if ! git merge-base --is-ancestor "$FLASHINFER_REQUESTED_HEAD" HEAD; then \
+            echo "Requested FlashInfer ref $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD) is not an ancestor of final HEAD $(git rev-parse HEAD) after PR application."; \
+            exit 1; \
+        fi; \
+        echo "Final FlashInfer source after PR application: requested $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
+
+# TEMPORARY PATCH: FlashInfer PR #3738 narrowed native FP4 profiler workspace
+# allocation to the FP8-activation family. Native SM100+ NVFP4 MoE uses FP4
+# activations and FP4 weights, so autotune allocates null quant workspaces and
+# fails in prepareQuantParams(). Remove after the upstream FlashInfer fix lands.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh")
+old_predicate = (
+    "  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();\n"
+)
+fixed_predicates = """  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();
+  // Native Blackwell NVFP4 uses FP4 activations and FP4 weights.
+  bool const is_native_wfp4afp4_family =
+      mSM >= 100 &&
+      (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
+      (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
+"""
+old_branch = "  if (is_native_wfp4afp8_family) {"
+fixed_branch = (
+    "  if (is_native_wfp4afp8_family || is_native_wfp4afp4_family) {"
+)
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot apply NVFP4 profiler patch")
+
+text = target.read_text()
+already_fixed = fixed_predicates in text and fixed_branch in text
+if already_fixed:
+    print("FlashInfer native NVFP4 profiler workaround already present; skipping")
+else:
+    if text.count(old_predicate) != 1 or text.count(old_branch) != 1:
+        raise SystemExit(
+            "Known FlashInfer PR #3738 profiler pattern not found exactly once; "
+            "refusing to apply an unverified patch"
+        )
+    text = text.replace(old_predicate, fixed_predicates, 1)
+    text = text.replace(old_branch, fixed_branch, 1)
+    target.write_text(text)
+    print("Applied FlashInfer native NVFP4 profiler workspace workaround")
+
+patched = target.read_text()
+if fixed_predicates not in patched or fixed_branch not in patched:
+    raise SystemExit("FlashInfer native NVFP4 profiler patch verification failed")
+PY
 
 # TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
 # RUN curl -fsL https://github.com/flashinfer-ai/flashinfer/pull/2927.diff -o pr2927.diff \
@@ -237,6 +321,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
+        git reset --hard HEAD && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -266,19 +351,29 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-ARG VLLM_PRESET_PRS=""
+# Temporary upstream fixes carried until they are present in the pinned vLLM ref.
+# See https://github.com/vllm-project/vllm/pull/47392
+# See https://github.com/vllm-project/vllm/pull/47618
+ARG VLLM_PRESET_PRS="47392 47618"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
+# PR refs include the branch history they were developed on. Use upstream main
+# only to identify each PR's patch range, then apply that patch to VLLM_REF.
 RUN set -eux; \
     VLLM_ALL_PRS=""; \
     VLLM_SELECTED_PRESET_PRS=""; \
+    VLLM_REQUESTED_HEAD="$(git rev-parse HEAD)"; \
     case "$VLLM_APPLY_PRESET_PRS" in \
         1|true|TRUE|yes|YES) VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS";; \
         0|false|FALSE|no|NO) VLLM_SELECTED_PRESET_PRS="";; \
         ""|auto|AUTO) \
             if [ -z "$VLLM_PRS" ]; then \
-                VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; \
+                if [ "$VLLM_REF" = "main" ]; then \
+                    VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; \
+                else \
+                    echo "Skipping preset vLLM PRs in auto mode because VLLM_REF=$VLLM_REF is not main."; \
+                fi; \
             fi;; \
         *) echo "Invalid VLLM_APPLY_PRESET_PRS value: $VLLM_APPLY_PRESET_PRS"; exit 1;; \
     esac; \
@@ -289,52 +384,152 @@ RUN set -eux; \
         esac; \
     done; \
     if [ -n "$VLLM_ALL_PRS" ]; then \
-        # Git requires a user identity to create merge commits
+        # cp -a preserves the source repository's index stat data, but the copied
+        # files have different filesystem identities. Refresh before --index apply.
+        git update-index --refresh; \
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
-        echo "Applying PRs: $VLLM_ALL_PRS"; \
+        echo "Applying PR patches to vLLM ref $VLLM_REF ($VLLM_REQUESTED_HEAD): $VLLM_ALL_PRS"; \
+        echo "Fetching origin/main only to calculate PR patch ranges; current checkout remains $VLLM_REF."; \
+        git fetch origin +refs/heads/main:refs/remotes/origin/main; \
         for pr in $VLLM_ALL_PRS; do \
-            echo "Fetching and merging PR #$pr..."; \
+            echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
-            if git merge-base --is-ancestor pr-${pr} HEAD; then \
-                echo "PR #$pr is already contained in HEAD; skipping."; \
-            else \
-                cherry_file="/tmp/pr-${pr}.cherry"; \
-                git cherry HEAD pr-${pr} > "$cherry_file"; \
-                if ! grep -q '^+' "$cherry_file"; then \
-                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
-                    rm -f "$cherry_file"; \
-                    continue; \
+            pr_base="$(git merge-base origin/main pr-${pr} || true)"; \
+            if [ -z "$pr_base" ]; then \
+                echo "Unable to find an origin/main merge-base for PR #$pr."; \
+                exit 1; \
+            fi; \
+            patch_file="/tmp/pr-${pr}.patch"; \
+            echo "PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
+            git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
+            if [ ! -s "$patch_file" ]; then \
+                echo "PR #$pr has no patch relative to origin/main; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --reverse --check --binary "$patch_file" >/dev/null 2>&1; then \
+                echo "PR #$pr patch is already applied to HEAD; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --3way --index --binary "$patch_file"; then \
+                if git diff --cached --quiet; then \
+                    echo "PR #$pr patch produced no staged changes; skipping."; \
+                else \
+                    git commit -m "Apply vLLM PR #${pr}"; \
                 fi; \
-                rm -f "$cherry_file"; \
-                git merge pr-${pr} --no-edit; \
+                rm -f "$patch_file"; \
+            else \
+                conflict_files="$(git diff --name-only --diff-filter=U)"; \
+                code_conflicts=""; \
+                for conflict_file in $conflict_files; do \
+                    case "$conflict_file" in \
+                        tests/*|docs/*|*.md|*.rst) ;; \
+                        *) code_conflicts="${code_conflicts:+$code_conflicts }$conflict_file";; \
+                    esac; \
+                done; \
+                if [ -z "$conflict_files" ]; then \
+                    echo "PR #$pr patch failed without unmerged files."; \
+                    rm -f "$patch_file"; \
+                    git reset --hard HEAD; \
+                    exit 1; \
+                fi; \
+                if [ -n "$code_conflicts" ]; then \
+                    echo "PR #$pr has code patch conflicts: $code_conflicts"; \
+                    rm -f "$patch_file"; \
+                    git reset --hard HEAD; \
+                    exit 1; \
+                fi; \
+                echo "Skipping tests/docs conflicts for PR #$pr: $conflict_files"; \
+                for conflict_file in $conflict_files; do \
+                    git checkout --ours -- "$conflict_file"; \
+                    git add "$conflict_file"; \
+                done; \
+                if git diff --cached --quiet; then \
+                    echo "PR #$pr only changed conflicting tests/docs files; skipping."; \
+                    git reset --hard HEAD; \
+                else \
+                    git commit -m "Apply vLLM PR #${pr}"; \
+                fi; \
+                rm -f "$patch_file"; \
             fi; \
         done; \
+        if ! git merge-base --is-ancestor "$VLLM_REQUESTED_HEAD" HEAD; then \
+            echo "Requested vLLM ref $VLLM_REF ($VLLM_REQUESTED_HEAD) is not an ancestor of final HEAD $(git rev-parse HEAD) after PR application."; \
+            exit 1; \
+        fi; \
+        echo "Final vLLM source after PR application: requested $VLLM_REF ($VLLM_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
 
-# TEMPORARY PATCH: revert vLLM PR #46756 / commit debec6440. It routes
-# ModelOpt MIXED_PRECISION MXFP8 entries through MXFP8 linear/MoE methods,
-# which corrupts generation for Qwen3.6-35B-A3B-NVFP4 and
-# Nemotron-3-Super-120B-A12B-NVFP4. Remove once upstream lands a fix.
-RUN set -eux; \
-    bad_commit="debec6440b89fe6ab14acb00e6eb2b04257f57a2"; \
-    target="vllm/model_executor/layers/quantization/modelopt.py"; \
-    marker='return ModelOptMxFp8LinearMethod(self.mxfp8_config)'; \
-    if git merge-base --is-ancestor "$bad_commit" HEAD && grep -Fq "$marker" "$target"; then \
-        echo "Reverting vLLM ModelOpt mixed MXFP8 regression commit ${bad_commit}"; \
-        if ! git revert --no-commit "$bad_commit"; then \
-            git revert --abort 2>/dev/null || true; \
-            echo "ERROR: failed to revert ${bad_commit}; upstream likely changed the ModelOpt MXFP8 path"; \
-            exit 1; \
-        fi; \
-        if grep -Fq "$marker" "$target"; then \
-            echo "ERROR: ModelOpt mixed MXFP8 dispatch marker is still present after revert"; \
-            exit 1; \
-        fi; \
-    else \
-        echo "ModelOpt mixed MXFP8 regression marker not present, or ${bad_commit} is not in this vLLM ref; skipping revert"; \
-    fi
+# TEMPORARY PATCH: vLLM PR #47914 added per-KV-group causal metadata by
+# treating non-bool causal as Mapping[int, bool]. DiffusionGemma passes a
+# per-request torch.Tensor causal mask and crashes on causal.get(...). Keep this
+# until upstream build_attn_metadata accepts Tensor causal again.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/v1/worker/gpu/attn_utils.py")
+bad_signature = "causal: bool | Mapping[int, bool] = True,"
+fixed_signature = "causal: bool | Mapping[int, bool] | torch.Tensor = True,"
+bad_group_causal = (
+    "        group_causal = causal if isinstance(causal, bool) else "
+    "causal.get(i, True)"
+)
+fixed_group_causal = """        if isinstance(causal, (bool, torch.Tensor)):
+            group_causal = causal
+        else:
+            group_causal = causal.get(i, True)"""
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot apply DiffusionGemma causal patch")
+
+text = target.read_text()
+if fixed_signature in text and fixed_group_causal in text:
+    print("DiffusionGemma Tensor causal workaround already present; skipping")
+elif bad_signature in text and bad_group_causal in text:
+    text = text.replace(bad_signature, fixed_signature, 1)
+    text = text.replace(bad_group_causal, fixed_group_causal, 1)
+    target.write_text(text)
+    print("Applied DiffusionGemma Tensor causal workaround for vLLM PR #47914")
+else:
+    print("Known vLLM PR #47914 causal regression pattern not found; skipping")
+PY
+
+# TEMPORARY PATCH: vLLM PR #43957 added a generic embedding-width guard for
+# EAGLE3, but Gemma4 MTP intentionally replaces its draft embedding with the
+# target backbone embedding before pre_projection. Without sharing, Gemma4 MTP
+# concatenates 1024-wide draft embeddings with 2816-wide backbone hidden states
+# and crashes in a 5632-wide pre_projection. Keep the guard scoped to EAGLE-style
+# draft models until upstream fixes https://github.com/vllm-project/vllm/issues/47794.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/v1/spec_decode/llm_base_proposer.py")
+old = """            if share_embeddings:
+                draft_embed = self.model.model.embed_tokens
+                # Only share when both models use the same embedding width.
+                # Guard with isinstance so non-Tensor weights (e.g. in tests)
+"""
+new = """            if share_embeddings and hasattr(self.model, "has_own_embed_tokens"):
+                draft_embed = self.model.model.embed_tokens
+                # Only share when both models use the same embedding width.
+                # Guard with isinstance so non-Tensor weights (e.g. in tests)
+"""
+
+if not target.exists():
+    print(f"{target} not found; skipping Gemma4 MTP embedding-share workaround")
+else:
+    text = target.read_text()
+    if 'if share_embeddings and hasattr(self.model, "has_own_embed_tokens"):' in text:
+        print("Gemma4 MTP embedding-share workaround already present; skipping")
+    elif old in text:
+        target.write_text(text.replace(old, new, 1))
+        print("Applied Gemma4 MTP embedding-share workaround")
+    else:
+        print("Known Gemma4 MTP embedding-share pattern not found; skipping")
+PY
 
 # TEMPORARY PATCH (source build only): vLLM PR #43008 selects cooperative_topk
 # for all SM90+ devices. On DGX Spark / SM12.x this fails at launch with
@@ -499,6 +694,174 @@ else:
         print("Known vulnerable RoutedExperts _load_single_value pattern not found; skipping")
 PY
 
+# DGX Spark UMA cleanup: profile warmup can leave temporary CUDA allocator
+# reservations behind just before vLLM sizes and allocates KV cache blocks.
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+
+target = Path("vllm/v1/worker/gpu_worker.py")
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot apply KV cache cleanup patch")
+
+text = target.read_text()
+lines = text.splitlines(keepends=True)
+changed = False
+
+profile_cleanup_present = (
+    "profile_result.after_profile.measure()" in text
+    and "diff_from_create.non_torch_memory" in text
+)
+prealloc_cleanup_present = (
+    "memory_reserved(self.device)" in text
+    and "memory_allocated(self.device)" in text
+    and "empty_cache()" in text
+)
+needs_cleanup = not (profile_cleanup_present and prealloc_cleanup_present)
+
+if needs_cleanup and not re.search(r"(?m)^import gc$", text):
+    insert_at = None
+    last_future_import = None
+    for i, line in enumerate(lines):
+        if line.startswith("from __future__ import "):
+            last_future_import = i
+        elif insert_at is None and (
+            line.startswith("import ") or line.startswith("from ")
+        ):
+            insert_at = i
+    if last_future_import is not None:
+        lines.insert(last_future_import + 1, "import gc\n")
+    elif insert_at is not None:
+        lines.insert(insert_at, "import gc\n")
+    else:
+        lines.insert(0, "import gc\n")
+    changed = True
+
+
+def find_line(pattern: str) -> tuple[int, re.Match[str]]:
+    regex = re.compile(pattern)
+    for index, line in enumerate(lines):
+        match = regex.match(line)
+        if match:
+            return index, match
+    raise SystemExit(f"Could not find expected vLLM pattern: {pattern}")
+
+
+def insert_after_docstring(func_index: int, func_indent: str, block: list[str]) -> None:
+    insert_at = func_index + 1
+    if insert_at < len(lines):
+        stripped = lines[insert_at].lstrip()
+        quote = None
+        if stripped.startswith(chr(34) * 3):
+            quote = chr(34) * 3
+        elif stripped.startswith(chr(39) * 3):
+            quote = chr(39) * 3
+
+        if quote is not None:
+            if stripped.count(quote) >= 2 and not stripped.startswith(quote * 2):
+                insert_at += 1
+            else:
+                insert_at += 1
+                while insert_at < len(lines):
+                    if quote in lines[insert_at]:
+                        insert_at += 1
+                        break
+                    insert_at += 1
+
+    lines[insert_at:insert_at] = block
+
+
+if not profile_cleanup_present:
+    snapshot_line = (
+        r"^(?P<indent>[ \t]+)free_gpu_memory = "
+        r"profile_result\.after_profile\.free_memory\n$"
+    )
+    index, match = find_line(snapshot_line)
+    indent = match.group("indent")
+    lines[index:index] = [
+        f"{indent}# spark-vllm-docker: post-profile cleanup before KV sizing\n",
+        f'{indent}if self.device_config.device_type == "cuda":\n',
+        f"{indent}    before_cleanup = profile_result.after_profile.free_memory\n",
+        f'{indent}    if hasattr(self.model_runner, "_cleanup_profiling_kv_cache"):\n',
+        f"{indent}        self.model_runner._cleanup_profiling_kv_cache()\n",
+        f"{indent}    gc.collect()\n",
+        f"{indent}    torch.cuda.synchronize(self.device)\n",
+        f"{indent}    torch.cuda.empty_cache()\n",
+        f"{indent}    profile_result.after_profile.measure()\n",
+        f"{indent}    diff_from_create = (\n",
+        f"{indent}        profile_result.after_profile - profile_result.before_create\n",
+        f"{indent}    )\n",
+        f"{indent}    profile_result.non_torch_increase = (\n",
+        f"{indent}        diff_from_create.non_torch_memory\n",
+        f"{indent}    )\n",
+        f"{indent}    profile_result.non_kv_cache_memory = (\n",
+        f"{indent}        profile_result.non_torch_increase\n",
+        f"{indent}        + profile_result.torch_peak_increase\n",
+        f"{indent}        + profile_result.weights_memory\n",
+        f"{indent}    )\n",
+        f"{indent}    cleanup_freed = (\n",
+        f"{indent}        profile_result.after_profile.free_memory - before_cleanup\n",
+        f"{indent}    )\n",
+        f"{indent}    if cleanup_freed > 0:\n",
+        f"{indent}        logger.info_once(\n",
+        f'{indent}            "Freed %.2f GiB before KV cache sizing; "\n',
+        f'{indent}            "non-torch profile increase is %.2f GiB.",\n',
+        f"{indent}            cleanup_freed / (1024**3),\n",
+        f"{indent}            profile_result.non_torch_increase / (1024**3),\n",
+        f"{indent}        )\n",
+        "\n",
+    ]
+    changed = True
+
+if not prealloc_cleanup_present:
+    func_index = None
+    func_indent = None
+    for i, line in enumerate(lines):
+        match = re.match(
+            r"^(?P<indent>[ \t]+)def initialize_from_config"
+            r"\(self,\s*kv_cache_config\b",
+            line,
+        )
+        if match:
+            func_index = i
+            func_indent = match.group("indent")
+            break
+
+    if func_index is None or func_indent is None:
+        raise SystemExit("Could not find initialize_from_config in vLLM gpu_worker.py")
+
+    body_indent = func_indent + "    "
+    block = [
+        f"{body_indent}# spark-vllm-docker: pre-KV cache allocator cleanup\n",
+        f'{body_indent}if self.device_config.device_type == "cuda":\n',
+        f"{body_indent}    gc.collect()\n",
+        f"{body_indent}    torch.cuda.synchronize(self.device)\n",
+        f"{body_indent}    cached_memory = max(\n",
+        f"{body_indent}        torch.cuda.memory_reserved(self.device)\n",
+        f"{body_indent}        - torch.cuda.memory_allocated(self.device),\n",
+        f"{body_indent}        0,\n",
+        f"{body_indent}    )\n",
+        f"{body_indent}    torch.cuda.empty_cache()\n",
+        f"{body_indent}    if cached_memory > 0:\n",
+        f"{body_indent}        logger.info_once(\n",
+        f'{body_indent}            "Cleared %.2f GiB of cached CUDA allocator memory before "\n',
+        f'{body_indent}            "KV cache allocation.",\n',
+        f"{body_indent}            cached_memory / (1024**3),\n",
+        f"{body_indent}        )\n",
+        "\n",
+    ]
+    insert_after_docstring(func_index, func_indent, block)
+    changed = True
+
+if changed:
+    target.write_text("".join(lines))
+    print("Applied Spark KV cache cleanup patch")
+else:
+    print("Equivalent Spark KV cache cleanup already present; skipping")
+PY
+
+
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
@@ -574,7 +937,7 @@ RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libibverbs1 libibverbs-dev rdma-core \
-    libxcb1 \
+    libxcb1 earlyoom \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv

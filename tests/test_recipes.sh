@@ -77,6 +77,22 @@ find_solo_recipe() {
     return 1
 }
 
+find_solo_recipe_with_tensor_parallel() {
+    for recipe in "$PROJECT_DIR/recipes/"*.yaml; do
+        if [[ -f "$recipe" ]]; then
+            cluster_only=$(get_recipe_flag "cluster_only" "$recipe")
+            if [[ "$cluster_only" == "true" ]]; then
+                continue
+            fi
+            if grep -q "{tensor_parallel}" "$recipe"; then
+                echo "$(basename "$recipe" .yaml)"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
 find_cluster_recipe() {
     for recipe in "$PROJECT_DIR/recipes/"*.yaml; do
         if [[ -f "$recipe" ]]; then
@@ -106,6 +122,24 @@ find_recipe_with_mods() {
         fi
     done
     return 1
+}
+
+recipe_has_mod() {
+    local recipe_file="$1"
+    local expected_mod="$2"
+    awk -v expected_mod="$expected_mod" '
+        /^mods:/ {inmods=1; next}
+        inmods && /^[[:space:]]*-[[:space:]]/ {
+            mod=$0
+            sub(/^[[:space:]]*-[[:space:]]*/, "", mod)
+            if (mod == expected_mod) {
+                found=1
+                exit
+            }
+        }
+        inmods && /^[^[:space:]]/ {exit}
+        END {exit found ? 0 : 1}
+    ' "$recipe_file"
 }
 
 get_recipe_mode() {
@@ -281,16 +315,16 @@ test_dry_run_generates_script() {
 test_solo_mode_tp1() {
     log_test "Solo mode sets tensor_parallel=1"
     
-    recipe_name=$(find_solo_recipe)
+    recipe_name=$(find_solo_recipe_with_tensor_parallel)
     if [[ -z "$recipe_name" ]]; then
-        log_skip "No solo-capable recipes found"
+        log_skip "No solo-capable recipes with tensor_parallel found"
         return
     fi
     
     output=$(run_recipe_dry_run "$recipe_name" "solo")
     
-    # Check that -tp 1 is in the output (solo mode should set tp=1)
-    if echo "$output" | grep -q "\-tp 1"; then
+    # Check that a tensor-parallel flag is set to 1 when the recipe exposes it.
+    if echo "$output" | grep -qE "(\-\-tensor-parallel-size|\-tp)[[:space:]]+1"; then
         log_pass "Solo mode correctly sets -tp 1"
     else
         log_fail "Solo mode did not set -tp 1"
@@ -319,23 +353,76 @@ test_solo_mode_removes_ray() {
     fi
 }
 
-# Test: Cluster mode preserves --distributed-executor-backend ray
-test_cluster_mode_keeps_ray() {
-    log_test "Cluster mode preserves --distributed-executor-backend ray"
-    
-    # Use minimax-m2-awq which explicitly has --distributed-executor-backend ray
+# Test: Explicit backend flags are rejected in solo mode
+test_solo_mode_rejects_backend_flags() {
+    log_test "Solo mode rejects explicit backend flags"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output_no_ray=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --no-ray 2>&1)
+    status_no_ray=$?
+    output_ray=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --ray 2>&1)
+    status_ray=$?
+
+    no_ray_rejected=false
+    ray_rejected=false
+    if [[ $status_no_ray -ne 0 ]] && echo "$output_no_ray" | grep -q -- "--no-ray is incompatible"; then
+        no_ray_rejected=true
+    fi
+    if [[ $status_ray -ne 0 ]] && echo "$output_ray" | grep -q -- "--ray is incompatible"; then
+        ray_rejected=true
+    fi
+
+    if [[ "$no_ray_rejected" == "true" && "$ray_rejected" == "true" ]]; then
+        log_pass "Solo mode rejects --ray and --no-ray"
+    else
+        log_fail "Solo mode did not reject explicit backend flags"
+        log_verbose "--no-ray status=$status_no_ray output=$output_no_ray"
+        log_verbose "--ray status=$status_ray output=$output_ray"
+    fi
+}
+
+# Test: Cluster mode defaults to no-Ray and strips --distributed-executor-backend ray
+test_cluster_mode_defaults_no_ray() {
+    log_test "Cluster mode defaults to no-Ray"
+
+    # Use minimax-m2-awq which explicitly has --distributed-executor-backend ray in the recipe
     if [[ ! -f "$PROJECT_DIR/recipes/minimax-m2-awq.yaml" ]]; then
         log_skip "minimax-m2-awq.yaml not found"
         return
     fi
-    
+
     output=$("$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run -n "192.168.1.1,192.168.1.2" 2>&1)
-    
-    # Check that --distributed-executor-backend IS in the output for cluster mode
-    if echo "$output" | grep -q "\-\-distributed-executor-backend ray"; then
-        log_pass "Cluster mode correctly preserves --distributed-executor-backend ray"
+
+    if ! echo "$output" | grep -q "\-\-distributed-executor-backend"; then
+        log_pass "Cluster mode correctly strips --distributed-executor-backend by default"
     else
-        log_fail "Cluster mode did not preserve --distributed-executor-backend"
+        log_fail "Cluster mode did not strip --distributed-executor-backend by default"
+        log_verbose "$output"
+    fi
+}
+
+# Test: --ray adds --distributed-executor-backend ray when recipe omits it
+test_ray_mode_adds_ray_backend() {
+    log_test "--ray adds --distributed-executor-backend ray"
+
+    # glm-4.7-flash-awq does not include the Ray backend in the recipe command
+    if [[ ! -f "$PROJECT_DIR/recipes/glm-4.7-flash-awq.yaml" ]]; then
+        log_skip "glm-4.7-flash-awq.yaml not found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" glm-4.7-flash-awq --dry-run -n "192.168.1.1,192.168.1.2" --ray 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+
+    if echo "$output" | grep -q "\-\-distributed-executor-backend ray" && echo "$launch_cmd" | grep -q "\-\-ray"; then
+        log_pass "--ray adds backend flag and passes --ray to launch-cluster.sh"
+    else
+        log_fail "--ray did not add backend flag or launch flag"
         log_verbose "$output"
     fi
 }
@@ -377,6 +464,20 @@ test_launch_cluster_help() {
         log_pass "--help documents --keep-entrypoint"
     else
         log_fail "--help does not document --keep-entrypoint"
+        log_verbose "$output"
+    fi
+
+    if echo "$output" | grep -q -- "--earlyoom"; then
+        log_pass "--help documents --earlyoom"
+    else
+        log_fail "--help does not document --earlyoom"
+        log_verbose "$output"
+    fi
+
+    if echo "$output" | grep -q -- "--ray"; then
+        log_pass "--help documents --ray"
+    else
+        log_fail "--help does not document --ray"
         log_verbose "$output"
     fi
 
@@ -871,6 +972,50 @@ test_launch_cmd_keep_entrypoint_passthrough() {
     fi
 }
 
+# Test: --earlyoom passthrough to launch-cluster.sh
+test_launch_cmd_earlyoom_passthrough() {
+    log_test "Launch command includes --earlyoom"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120" 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+
+    if echo "$launch_cmd" | grep -q "\-\-earlyoom" && \
+       echo "$launch_cmd" | grep -q "\-\-earlyoom-args -M 786432,196608 -s 100 -r 120"; then
+        log_pass "Launch command includes --earlyoom and custom args"
+    else
+        log_fail "--earlyoom flags not found in launch command"
+        log_verbose "Launch cmd: $launch_cmd"
+    fi
+}
+
+# Test: --earlyoom rejects --keep-entrypoint
+test_launch_cmd_earlyoom_rejects_keep_entrypoint() {
+    log_test "--earlyoom rejects --keep-entrypoint"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --earlyoom --keep-entrypoint 2>&1 || true)
+
+    if echo "$output" | grep -q "\-\-earlyoom requires launch-cluster.sh to clear the image entrypoint"; then
+        log_pass "--earlyoom rejects --keep-entrypoint"
+    else
+        log_fail "--earlyoom did not reject --keep-entrypoint"
+        log_verbose "$output"
+    fi
+}
+
 # ==============================================================================
 # README Documentation Verification Tests
 # ==============================================================================
@@ -973,11 +1118,12 @@ test_readme_minimax() {
         "${MINIMAX_ARGS[@]}"
 }
 
-# Test: glm-4.7-flash-awq includes correct mod
+# Test: glm-4.7-flash-awq mod launch args match the recipe
 test_readme_glm_flash_mod() {
     log_test "README match: glm-4.7-flash-awq mod path"
     
-    if [[ ! -f "$PROJECT_DIR/recipes/glm-4.7-flash-awq.yaml" ]]; then
+    local recipe_file="$PROJECT_DIR/recipes/glm-4.7-flash-awq.yaml"
+    if [[ ! -f "$recipe_file" ]]; then
         log_skip "glm-4.7-flash-awq.yaml not found"
         return
     fi
@@ -986,10 +1132,17 @@ test_readme_glm_flash_mod() {
     output=$(run_recipe_dry_run "glm-4.7-flash-awq" "$mode")
     launch_cmd=$(extract_launch_cmd "$output")
     
-    if echo "$launch_cmd" | grep -q "$GLM_FLASH_AWQ_MOD"; then
-        log_pass "README match: glm-4.7-flash-awq has correct mod path"
+    if recipe_has_mod "$recipe_file" "$GLM_FLASH_AWQ_MOD"; then
+        if echo "$launch_cmd" | grep -q "$GLM_FLASH_AWQ_MOD"; then
+            log_pass "README match: glm-4.7-flash-awq has correct mod path"
+        else
+            log_fail "README match: glm-4.7-flash-awq missing expected mod: $GLM_FLASH_AWQ_MOD"
+            log_verbose "Launch cmd: $launch_cmd"
+        fi
+    elif ! echo "$launch_cmd" | grep -q "$GLM_FLASH_AWQ_MOD"; then
+        log_pass "README match: glm-4.7-flash-awq correctly omits optional mod"
     else
-        log_fail "README match: glm-4.7-flash-awq missing expected mod: $GLM_FLASH_AWQ_MOD"
+        log_fail "README match: glm-4.7-flash-awq unexpectedly applied mod: $GLM_FLASH_AWQ_MOD"
         log_verbose "Launch cmd: $launch_cmd"
     fi
 }
@@ -1040,14 +1193,26 @@ verify_cluster_args() {
     fi
 }
 
-# Test: openai-gpt-oss-120b cluster mode has correct tensor_parallel and ray backend
+# Test: openai-gpt-oss-120b is solo-only
 test_readme_gpt_oss_cluster() {
-    verify_cluster_args "openai-gpt-oss-120b" \
-        "$GPT_OSS_CLUSTER_TP" \
-        "${GPT_OSS_CLUSTER_ARGS[@]}"
+    log_test "README match (cluster): openai-gpt-oss-120b is solo-only"
+
+    if [[ ! -f "$PROJECT_DIR/recipes/openai-gpt-oss-120b.yaml" ]]; then
+        log_skip "openai-gpt-oss-120b.yaml not found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" openai-gpt-oss-120b --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
+
+    if echo "$output" | grep -q "requires solo mode"; then
+        log_pass "README match (cluster): openai-gpt-oss-120b rejects cluster mode"
+    else
+        log_fail "README match (cluster): openai-gpt-oss-120b should reject cluster mode"
+        log_verbose "$output"
+    fi
 }
 
-# Test: minimax-m2-awq cluster mode has correct tensor_parallel and ray backend
+# Test: minimax-m2-awq cluster mode has correct tensor_parallel
 test_readme_minimax_cluster() {
     verify_cluster_args "minimax-m2-awq" \
         "$MINIMAX_CLUSTER_TP" \
@@ -1331,7 +1496,9 @@ main() {
     test_dry_run_generates_script
     test_solo_mode_tp1
     test_solo_mode_removes_ray
-    test_cluster_mode_keeps_ray
+    test_solo_mode_rejects_backend_flags
+    test_cluster_mode_defaults_no_ray
+    test_ray_mode_adds_ray_backend
     test_cli_override_port
     echo ""
     
@@ -1352,6 +1519,8 @@ main() {
     test_launch_cmd_publish_passthrough
     test_launch_cmd_publish_rejects_cluster
     test_launch_cmd_keep_entrypoint_passthrough
+    test_launch_cmd_earlyoom_passthrough
+    test_launch_cmd_earlyoom_rejects_keep_entrypoint
     echo ""
     
     # README documentation verification tests

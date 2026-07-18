@@ -40,6 +40,7 @@ command: |
     --gpu-memory-utilization {gpu_memory_utilization} \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
     --kv-cache-dtype fp8 \
     --load-format fastsafetensors \
     --attention-backend flashinfer \

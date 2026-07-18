@@ -22,7 +22,7 @@ GLM_FLASH_AWQ_ARGS=(
     "--max-model-len 202752"
     "--max-num-batched-tokens 4096"
     "--max-num-seqs 64"
-    "--gpu-memory-utilization 0.7"
+    "--gpu-memory-utilization 0.8"
     "--port 8000"
     "--host 0.0.0.0"
 )
@@ -39,7 +39,7 @@ GPT_OSS_ARGS=(
     "--enable-auto-tool-choice"
     "--tool-call-parser openai"
     "--reasoning-parser openai_gptoss"
-    "--gpu-memory-utilization 0.7"
+    "--gpu-memory-utilization 0.8"
     "--enable-prefix-caching"
     "--load-format fastsafetensors"
     "--quantization mxfp4"
@@ -59,12 +59,12 @@ MINIMAX_CONTAINER="vllm-node"
 MINIMAX_ARGS=(
     "--port 8000"
     "--host 0.0.0.0"
-    "--gpu-memory-utilization 0.7"
+    "--gpu-memory-utilization 0.8"
     "--max-model-len 128000"
     "--load-format fastsafetensors"
     "--enable-auto-tool-choice"
     "--tool-call-parser minimax_m2"
-    "--reasoning-parser minimax_m2_append_think"
+    "--reasoning-parser minimax_m2"
 )
 
 # ==============================================================================
@@ -76,14 +76,8 @@ MINIMAX_ARGS=(
 # glm-4.7-flash-awq cluster mode (no distributed backend - single GPU model)
 GLM_FLASH_AWQ_CLUSTER_TP="1"
 
-# openai-gpt-oss-120b cluster mode (2 nodes = tp 2)
-GPT_OSS_CLUSTER_TP="2"
-GPT_OSS_CLUSTER_ARGS=(
-    "--distributed-executor-backend ray"
-)
+# openai-gpt-oss-120b is solo_only; cluster mode is tested as a rejection.
 
 # minimax-m2-awq cluster mode (2 nodes = tp 2)
 MINIMAX_CLUSTER_TP="2"
-MINIMAX_CLUSTER_ARGS=(
-    "--distributed-executor-backend ray"
-)
+MINIMAX_CLUSTER_ARGS=()

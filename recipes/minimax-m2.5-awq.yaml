@@ -3,7 +3,7 @@
 
 recipe_version: "1"
 name: MiniMax-M2.5-AWQ
-description: vLLM serving MiniMax-M2.5-AWQ with Ray distributed backend
+description: vLLM serving MiniMax-M2.5-AWQ on a multi-node cluster
 
 # HuggingFace model to download (optional, for --download-model)
 model: cyankiwi/MiniMax-M2.5-AWQ-4bit

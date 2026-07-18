@@ -83,7 +83,7 @@ block-beta
 
 ## Connecting more than 2 Sparks in the cluster using a switch
 
-To connect more than 2 Sparks, you will need a proper switch, for example [Microtik CRS812-DDQ](https://mikrotik.com/product/crs812_ddq).
+To connect more than 2 Sparks, you will need a proper switch, for example [Microtik CRS812-DDQ](https://mikrotik.com/product/crs812_ddq) or [Mikrotik CRS804-DDQ](https://mikrotik.com/product/crs804_ddq).
 Please refer to [this post](https://forums.developer.nvidia.com/t/6x-spark-setup/354399/56) for an example of setting up a 6-8 node Spark cluster.
 
 ## Network setup
