@@ -42,6 +42,7 @@ env:
   MKL_NUM_THREADS: 10 
   CUTE_DSL_ARCH: sm_121a 
 
+
 # try these out at some point
 #  TORCH_CUDA_ARCH_LIST: 12.1a
 #  FLASHINFER_CUDA_ARCH_LIST: 12.1a

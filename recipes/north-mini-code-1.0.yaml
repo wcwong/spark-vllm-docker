@@ -19,7 +19,7 @@ mods:
 defaults:
   port: 30000
   host: 0.0.0.0
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.88
   max_model_len: 320000
   max_num_batched_tokens: 32768
   max_num_seqs: 4
@@ -51,8 +51,7 @@ command: |
       --max-model-len {max_model_len} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --max-num-seqs {max_num_seqs} \
-      --load-format instanttensor
-
-#       --attention-backend flashinfer \
-#      --chat-template chat_template.jinja \
-#      --gdn-prefill-backend {gdn_prefill_backend}
+      --load-format instanttensor \
+      --attention-backend flashinfer \
+      --chat-template chat_template.jinja \
+      --gdn-prefill-backend {gdn_prefill_backend}

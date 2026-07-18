@@ -1,4 +1,4 @@
-# Recipe: Nemotron-3-Super-NVFP4
+ # Recipe: Nemotron-3-Super-NVFP4
 recipe_version: "1"
 name: Nemotron-3-Super-NVFP4-b12x 
 description: vLLM serving Nemotron-3-Super-120B using b12x
@@ -7,8 +7,6 @@ description: vLLM serving Nemotron-3-Super-120B using b12x
 
 model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
 container: vllm-node
-cluster_only: false
-solo_only: false
 
 # for the reasoning parser.
 
@@ -18,33 +16,31 @@ mods:
 env:
   VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
-  VLLM_USE_FLASHINFER_MOE_FP4: 1
-  VLLM_NVFP4_GEMM_BACKEND: flashinfer-cutlass
+  VLLM_FLOAT32_MATMUL_PRECISION: high 
+  OMP_NUM_THREADS: 10 
+  MKL_NUM_THREADS: 10 
 
 container: vllm-node
 
 defaults:
-  port: 8000
+  port: 30000
   host: 0.0.0.0
-  tensor_parallel: 1
-  gpu_memory_utilization: 0.90
-  max_model_len: 1000000
+  gpu_memory_utilization: 0.75
+  max_model_len: 262144
   max_num_seqs: 4
-  moe_backend: flashinfer-cutlass
-  quantization: modelopt_fp4
-  attention_backend: TRITON_ATTN
+  moe_backend: flashinfer_cutlass
+  linear_backend: flashinfer-cutlass
+  quantization: modelopt_nvfp4
+  attention_backend: FLASHINFER
 
 command: |
   vllm serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
     --served-model-name nemotron-3-super \
-    --host {host} \
-    --port {port} \
-    --async-scheduling \
-    --dtype auto \
-    --kv-cache-dtype fp8 \
-    --tensor-parallel-size {tensor_parallel} \
-    --pipeline-parallel-size 1 \
-    --data-parallel-size 1 \
+    --host {host} --port {port} \
+    --dtype bfloat16 \
+    --disable-cascade-attn \
+    --kv-cache-dtype auto \
+    --load-format fastsafetensors \
     --trust-remote-code \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --enable-chunked-prefill \
@@ -54,8 +50,10 @@ command: |
     --mamba_ssm_cache_dtype float32 \
     --quantization {quantization} \
     --attention-backend {attention_backend} \
+    --linear-backend {linear_backend} \
+    --max_num_batched_tokens=16384 \
     --speculative_config '{{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}}' \
-    --reasoning-parser-plugin super_v3_reasoning_parser.py \
+    --reasoning-parser-plugin /workspace/vllm/super_v3_reasoning_parser.py \
     --reasoning-parser super_v3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder

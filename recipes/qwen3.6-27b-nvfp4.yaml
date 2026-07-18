@@ -25,26 +25,28 @@ defaults:
 #  kv_cache_dtype: nvfp4
 
 # b12x added in https://github.com/vllm-project/vllm/pull/40082
-#  linear_backend: flashinfer-b12x
+#  linear_backend: flashinfer_b12x
   linear_backend: flashinfer_cutlass
 #   attention_backend: flashinfer
-  attention_backend: flash_attn
+  attention_backend: FLASH_ATTN
 
 # cutedsl and flashinfer is not supported yet b/c of head_k_dim
 # falling back to Triton/FLA.(requested=flashinfer, head_k_dim=None).
 #  gdn_prefill_backend: cutedsl
-#  gdn_prefill_backend: flashinfer
-  gdn_prefill_backend: cutedsl
+  gdn_prefill_backend: flashinfer
+#  gdn_prefill_backend: cutedsl
 
 env:
   NCCL_DEBUG_SUBSYS: INIT,ENV,NET,GRAPH
   VLLM_FLOAT32_MATMUL_PRECISION: high 
   TORCH_MATMUL_PRECISION: high
-  OMP_NUM_THREADS: 10 
+  OMP_NUM_THREADS: 10
   MKL_NUM_THREADS: 10 
   CUTE_DSL_ARCH: sm_121a 
   # use flashinfer instead of nccl all reduce
   VLLM_ALLREDUCE_USE_FLASHINFER: 1  
+  CUDA_SCALE_LAUNCH_QUEUES: 4x
+
 
 command: |
   vllm serve unsloth/Qwen3.6-27B-NVFP4 \

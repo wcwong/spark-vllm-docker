@@ -21,10 +21,10 @@ mods:
 
 # Default settings (can be overridden via CLI)
 defaults:
-  port: 8000
+  port: 30000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 108
+  gpu_memory_utilization: 110
   max_model_len: 262144
   max_num_seqs: 2
 
