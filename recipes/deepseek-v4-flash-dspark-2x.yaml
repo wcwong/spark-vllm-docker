@@ -1,0 +1,87 @@
+# recipes/deepseek-v4-flash-dspark-2x.yaml
+
+recipe_version: "1"
+
+name: DeepSeek-V4-Flash-DSpark-2x
+description: >-
+  DeepSeek V4 Flash DSpark on two DGX Sparks using native
+  vLLM multi-node execution without Ray.
+
+model: deepseek-ai/DeepSeek-V4-Flash-DSpark
+container: vllm-node
+
+cluster_only: true
+mods: []
+
+defaults:
+  host: 0.0.0.0
+  port: 30000
+
+  tensor_parallel: 2
+
+  max_model_len: 524288
+  block_size: 256
+  max_num_batched_tokens: 9216
+  max_num_seqs: 2
+  num_speculative_tokens: 5
+  gpu_memory_utilization: .90
+#  kv_cache_memory:  26g
+  load_format: instanttensor
+
+  # Backend selections: change these when testing alternatives.
+  moe_backend: auto 
+# flashinfer_cutlass
+
+  linear_backend: auto
+  mla_prefill_backend: FLASH_ATTN
+
+env:
+  CUDA_SCALE_LAUNCH_QUEUES: "4x"
+  CUTE_DSL_ARCH: "sm_121a"
+
+  OMP_NUM_THREADS: "10"
+  MKL_NUM_THREADS: "10"
+
+  VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: "1"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash-DSpark \
+    --trust-remote-code \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --load-format {load_format} \
+    --kv-cache-dtype fp8_ds_mla \
+    --block-size {block_size} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --attention-config '{{"mla_prefill_backend":"{mla_prefill_backend}"}}' \
+    --linear-backend {linear_backend} \
+    --moe-backend {moe_backend} \
+    --enable-expert-parallel \
+    --tokenizer-mode deepseek_v4 \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"greedy"}}' \
+    --compilation-config '{{"mode":3,"cudagraph_mode":"PIECEWISE","custom_ops":["all"]}}' \
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
+    --default-chat-template-kwargs.thinking=true \
+    --default-chat-template-kwargs.reasoning_effort=max \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --cudagraph-metrics \
+    --enable-mfu-metrics \
+    --enable-bf16x3-router-gemm \
+    --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
+    --all2all-backend allgather_reducescatter
+
+#     --kv-cache-memory {kv_cache_memory} \
+# --attention-config '{{"mla_prefill_backend":"{mla_prefill_backend}","use_prefill_query_quantization": true}}' \
+
+
+ 
