@@ -299,9 +299,10 @@ ARG CACHEBUST_VLLM=1
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
-# DeepGEMM nv_dev includes SM120/SM121 MXFP4 support from PR #324.
+# Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
+# regression first observed at nv_dev f8e8fb5 (PR #384); last known good.
 ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
-ARG DEEPGEMM_REF=nv_dev
+ARG DEEPGEMM_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
 ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
@@ -353,8 +354,7 @@ WORKDIR $VLLM_BASE_DIR/vllm
 
 # Temporary upstream fixes carried until they are present in the pinned vLLM ref.
 # See https://github.com/vllm-project/vllm/pull/47392
-# See https://github.com/vllm-project/vllm/pull/47618
-ARG VLLM_PRESET_PRS="47392 47618"
+ARG VLLM_PRESET_PRS="47392"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
