@@ -38,7 +38,7 @@ env:
   OMP_NUM_THREADS: "10"
   MKL_NUM_THREADS: "10"
 
-  VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: "trtllm::fused_moe::gemm1,trtllm::fused_moe::gemm2"
+#  VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: "trtllm::fused_moe::gemm1,trtllm::fused_moe::gemm2"
   VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: "1"
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 

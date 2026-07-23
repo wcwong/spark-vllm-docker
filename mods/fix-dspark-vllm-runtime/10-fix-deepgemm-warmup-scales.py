@@ -1,149 +1,117 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import ast
-import pathlib
+import hashlib
+import importlib.util
+import os
+from pathlib import Path
+import shutil
 import sys
+import tempfile
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from patchlib import (  # noqa: E402
-    apply_replacements,
-    install_plans,
-    locate_vllm_root,
-    make_plan,
-    node_byte_span,
-)
+NAME = "deepgemm-warmup-scales"
+TARGET = Path("model_executor/warmup/deep_gemm_warmup.py")
 
-FIX_NAME = "deepgemm-warmup-scales"
-EXPECTED_SCALE_PATHS = {
-    ("_deepgemm_fp8_gemm_nt_warmup",),
-    ("_deepgemm_grouped_fp8_gemm_nt_contiguous_warmup", "_warmup"),
-}
-
-
-def function_name(func: ast.expr) -> str | None:
-    if (
-        isinstance(func, ast.Attribute)
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "torch"
-        and func.attr in {"empty", "ones"}
-    ):
-        return func.attr
-    return None
+REPLACEMENTS = [
+    (
+        """    a1q = torch.empty((max_tokens, k), device=device, dtype=torch.float8_e4m3fn)\n    a1q_scales = torch.empty(\n        (max_tokens, k // block_m), device=device, dtype=torch.float32\n    )\n""",
+        """    a1q = torch.empty((max_tokens, k), device=device, dtype=torch.float8_e4m3fn)\n    a1q_scales = torch.ones(\n        (max_tokens, k // block_m), device=device, dtype=torch.float32\n    )\n""",
+    ),
+    (
+        """        a1q = torch.empty((MAX_M, k), device=device, dtype=torch.float8_e4m3fn)\n        a1q_scales = torch.empty(\n            (MAX_M, k // block_m), device=device, dtype=torch.float32\n        )\n""",
+        """        a1q = torch.empty((MAX_M, k), device=device, dtype=torch.float8_e4m3fn)\n        a1q_scales = torch.ones(\n            (MAX_M, k // block_m), device=device, dtype=torch.float32\n        )\n""",
+    ),
+]
 
 
-class FunctionPathVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.function_stack: list[str] = []
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self.function_stack.append(node.name)
-        try:
-            self.generic_visit(node)
-        finally:
-            self.function_stack.pop()
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self.function_stack.append(node.name)
-        try:
-            self.generic_visit(node)
-        finally:
-            self.function_stack.pop()
+def vllm_root() -> Path:
+    override = os.environ.get("VLLM_ROOT")
+    if override:
+        root = Path(override).resolve()
+    else:
+        spec = importlib.util.find_spec("vllm")
+        if spec is None or not spec.submodule_search_locations:
+            raise RuntimeError("unable to locate the installed vllm package")
+        roots = list(spec.submodule_search_locations)
+        if len(roots) != 1:
+            raise RuntimeError(f"expected one vllm package root, found: {roots!r}")
+        root = Path(roots[0]).resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"invalid vLLM root: {root}")
+    return root
 
 
-class ScaleFinder(FunctionPathVisitor):
-    def __init__(self) -> None:
-        super().__init__()
-        self.matches: dict[tuple[str, ...], list[ast.Attribute]] = {
-            path: [] for path in EXPECTED_SCALE_PATHS
-        }
-
-    def _visit_assignment(self, node: ast.Assign | ast.AnnAssign) -> None:
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(
-            isinstance(target, ast.Name) and target.id == "a1q_scales"
-            for target in targets
-        ):
-            return
-        path = tuple(self.function_stack)
-        if path not in self.matches:
-            return
-        value = node.value
-        if not isinstance(value, ast.Call) or function_name(value.func) is None:
-            rendered = ast.unparse(value) if value is not None else "None"
-            raise RuntimeError(
-                f"Unexpected a1q_scales assignment in {path!r}: {rendered}"
-            )
-        assert isinstance(value.func, ast.Attribute)
-        self.matches[path].append(value.func)
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        self._visit_assignment(node)
-        self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self._visit_assignment(node)
-        self.generic_visit(node)
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def patch(source: bytes, filename: str) -> tuple[bytes, str]:
-    tree = ast.parse(source.decode("utf-8"), filename=filename)
-    finder = ScaleFinder()
-    finder.visit(tree)
+def install(path: Path, new_text: str) -> None:
+    backup = path.with_name(path.name + ".orig")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+        print(f"[{NAME}] created backup: {backup}")
 
-    nodes: dict[tuple[str, ...], ast.Attribute] = {}
-    for path, matches in finder.matches.items():
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"Expected one a1q_scales assignment in {path!r}; "
-                f"found {len(matches)}"
-            )
-        nodes[path] = matches[0]
+    mode = path.stat().st_mode
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="", dir=path.parent, delete=False
+    ) as tmp:
+        tmp.write(new_text)
+        tmp_path = Path(tmp.name)
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
 
-    states = {path: function_name(node) for path, node in nodes.items()}
-    state_values = set(states.values())
-    description = "DeepGEMM synthetic warmup scales use torch.ones"
-    if state_values == {"ones"}:
-        return source, description
-    if state_values != {"empty"}:
-        raise RuntimeError(f"Partial or unexpected patch state: {states}")
-
-    replacements: list[tuple[int, int, bytes]] = []
-    for path, node in nodes.items():
-        start, end = node_byte_span(node, source)
-        if source[start:end] != b"torch.empty":
-            raise RuntimeError(
-                f"Source verification failed at {path!r}: "
-                f"found {source[start:end]!r}"
-            )
-        replacements.append((start, end, b"torch.ones"))
-
-    patched = apply_replacements(source, replacements)
-    compile(patched.decode("utf-8"), filename, "exec")
-
-    verify_tree = ast.parse(patched.decode("utf-8"), filename=filename)
-    verify = ScaleFinder()
-    verify.visit(verify_tree)
-    verify_states = {
-        path: function_name(matches[0])
-        for path, matches in verify.matches.items()
-        if len(matches) == 1
-    }
-    if verify_states != {path: "ones" for path in EXPECTED_SCALE_PATHS}:
-        raise RuntimeError(f"Semantic verification failed: {verify_states}")
-    return patched, description
+    pycache = path.parent / "__pycache__"
+    if pycache.is_dir():
+        for cached in pycache.glob(f"{path.stem}.*.pyc"):
+            cached.unlink()
 
 
 def main() -> None:
-    root = locate_vllm_root()
-    print(f"[{FIX_NAME}] vLLM root: {root}", flush=True)
-    target = root / "model_executor" / "warmup" / "deep_gemm_warmup.py"
-    try:
-        plan = make_plan(target, patch)
-        install_plans(FIX_NAME, [plan])
-    except (UnicodeDecodeError, SyntaxError, RuntimeError) as exc:
-        raise SystemExit(f"[{FIX_NAME}] refusing to patch vLLM: {exc}") from exc
+    root = vllm_root()
+    path = root / TARGET
+    if not path.is_file():
+        raise RuntimeError(f"target file not found: {path}")
+
+    original = path.read_text(encoding="utf-8")
+    states = []
+    for old, new in REPLACEMENTS:
+        old_count = original.count(old)
+        new_count = original.count(new)
+        if old_count == 1 and new_count == 0:
+            states.append("old")
+        elif old_count == 0 and new_count == 1:
+            states.append("new")
+        else:
+            raise RuntimeError(
+                f"unexpected source in {path}: old_count={old_count}, "
+                f"new_count={new_count}; review this fix before using it"
+            )
+
+    print(f"[{NAME}] vLLM root: {root}")
+    print(f"[{NAME}] target: {path}")
+
+    if all(state == "new" for state in states):
+        print(f"[{NAME}] already applied")
+        return
+    if not all(state == "old" for state in states):
+        raise RuntimeError(f"partially applied fix detected in {path}")
+
+    updated = original
+    for old, new in REPLACEMENTS:
+        updated = updated.replace(old, new, 1)
+    compile(updated, str(path), "exec")
+
+    before = sha256(original.encode())
+    install(path, updated)
+    after = sha256(path.read_bytes())
+    print(f"[{NAME}] before SHA256: {before}")
+    print(f"[{NAME}] installed SHA256: {after}")
+    print(f"[{NAME}] applied: initialize synthetic DeepGEMM scales with torch.ones")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"[{NAME}] ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

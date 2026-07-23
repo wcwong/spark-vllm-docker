@@ -2,322 +2,364 @@
 from __future__ import annotations
 
 import ast
-import pathlib
+import hashlib
+import importlib.util
+import os
+from pathlib import Path
+import shutil
 import sys
+import tempfile
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from patchlib import (  # noqa: E402
-    apply_replacements,
-    full_line_end,
-    full_line_start,
-    install_plans,
-    locate_vllm_root,
-    make_plan,
-    node_byte_span,
-)
+NAME = "packed-kv-zeroing"
+TARGET = Path("v1/worker/utils.py")
 
-FIX_NAME = "packed-kv-zeroing"
-HELPER_NAME = "zero_kv_cache_blocks_inplace"
+SETUP_LINE = "        packed_storage_strides: dict[int, int] = {}\n"
 
-HELPER_SOURCE = '''def zero_kv_cache_blocks_inplace(
-    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
-    num_blocks: int,
-    block_ids: Sequence[int],
-) -> None:
-    """Zero complete physical blocks in block-major packed KV storage.
+NEW_LOOP = '''                el = kv.element_size()
+                cur_bytes = kv.stride(block_dim) * el
+                assert cur_bytes % 4 == 0
 
-    Packed KV tensors are offset views into a shared allocation. Their block
-    stride spans the complete physical block, so zeroing from each view's
-    data_ptr() can overlap neighboring components. Deduplicate by underlying
-    storage and clear each physical block exactly once.
-    """
-    if not block_ids:
-        return
-    if num_blocks <= 0:
-        raise ValueError(f"num_blocks must be positive, got {num_blocks}")
+                # Packed cache groups expose per-layer views into one shared,
+                # block-major storage slab. In that layout, cur_bytes is the
+                # complete physical scheduler-block stride, while
+                # spec.page_size_bytes is only this layer's logical page.
+                if cur_bytes > spec.page_size_bytes:
+                    assert block_dim == 0, (
+                        "Packed KV cache views must use a blocks-first layout"
+                    )
+                    storage = kv.untyped_storage()
+                    storage_ptr = storage.data_ptr()
+                    previous_stride = packed_storage_strides.get(storage_ptr)
+                    if previous_stride is not None:
+                        assert previous_stride == cur_bytes, (
+                            "Packed KV cache views sharing a storage allocation "
+                            f"have different block strides: {previous_stride} "
+                            f"vs {cur_bytes}"
+                        )
+                        continue
+                    assert storage.nbytes() % cur_bytes == 0, (
+                        "Packed KV cache storage must contain whole physical blocks"
+                    )
+                    packed_storage_strides[storage_ptr] = cur_bytes
+                    cur_page_el = cur_bytes // 4
 
-    storage_tensors: list[torch.Tensor] = []
-    seen_storage: set[int] = set()
-    for entry in kv_caches:
-        tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
-        for tensor in tensors:
-            storage_ptr = tensor.untyped_storage().data_ptr()
-            if storage_ptr in seen_storage:
-                continue
-            seen_storage.add(storage_ptr)
-            storage_tensors.append(tensor)
+                    if page_size_el is None:
+                        page_size_el = cur_page_el
+                    else:
+                        assert page_size_el == cur_page_el, (
+                            f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
+                        )
+                    seg_addrs.append(storage_ptr)
+                    continue
 
-    if not storage_tensors:
-        return
+                # Preserve the upstream path for ordinary cache allocations,
+                # including virtual block splitting and outer K/V enumeration.
+                dp = kv.data_ptr()
+                if dp in seen_ptrs:
+                    continue
+                seen_ptrs.add(dp)
 
-    block_ids_np = np.asarray(block_ids, dtype=np.int64)
-    if np.any(block_ids_np < 0) or np.any(block_ids_np >= num_blocks):
-        raise IndexError(
-            f"KV block id outside [0, {num_blocks}): {block_ids_np.tolist()}"
-        )
+                kernel_block_el = cur_bytes // 4
+                cur_page_el = kernel_block_el * ratio
 
-    device = storage_tensors[0].device
-    block_ids_gpu = async_tensor_h2d(block_ids_np, device=device)
-    for tensor in storage_tensors:
-        if tensor.device != device:
-            raise RuntimeError(
-                "Packed KV cache storages must be on one device: "
-                f"expected {device}, found {tensor.device}"
-            )
-        storage_bytes = torch.empty(0, dtype=torch.uint8, device=device)
-        storage_bytes.set_(tensor.untyped_storage())
-        if storage_bytes.numel() % num_blocks != 0:
-            raise RuntimeError(
-                "Packed KV storage size is not divisible by num_blocks: "
-                f"{storage_bytes.numel()} bytes / {num_blocks} blocks"
-            )
-        physical_blocks = storage_bytes.view(num_blocks, -1)
-        physical_blocks.index_fill_(0, block_ids_gpu, 0)
+                if page_size_el is None:
+                    page_size_el = cur_page_el
+                else:
+                    assert page_size_el == cur_page_el, (
+                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
+                    )
 
-
+                block_stride_bytes = cur_bytes
+                outer_dims = [
+                    d
+                    for d in range(block_dim)
+                    if kv.stride(d) * el > block_stride_bytes
+                ]
+                outer_strides = [kv.stride(d) * el for d in outer_dims]
+                for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
+                    off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
+                    seg_addrs.append(dp + off_bytes)
 '''
 
 
-def top_level_functions(tree: ast.Module) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
-    return {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+def vllm_root() -> Path:
+    override = os.environ.get("VLLM_ROOT")
+    if override:
+        root = Path(override).resolve()
+    else:
+        spec = importlib.util.find_spec("vllm")
+        if spec is None or not spec.submodule_search_locations:
+            raise RuntimeError("unable to locate the installed vllm package")
+        roots = list(spec.submodule_search_locations)
+        if len(roots) != 1:
+            raise RuntimeError(f"expected one vllm package root, found: {roots!r}")
+        root = Path(roots[0]).resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"invalid vLLM root: {root}")
+    return root
 
 
-def imported_names(tree: ast.Module) -> set[str]:
-    names: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                names.add(alias.asname or alias.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                names.add(alias.asname or alias.name)
-    return names
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def patch_utils(source: bytes, filename: str) -> tuple[bytes, str]:
-    text = source.decode("utf-8")
-    tree = ast.parse(text, filename=filename)
-    functions = top_level_functions(tree)
-    description = "add storage-aware physical-block zeroing helper"
+def install(path: Path, new_text: str) -> None:
+    backup = path.with_name(path.name + ".orig")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+        print(f"[{NAME}] created backup: {backup}")
 
-    if HELPER_NAME in functions:
-        helper_text = ast.get_source_segment(text, functions[HELPER_NAME]) or ""
-        required_fragments = (
-            "untyped_storage().data_ptr()",
-            "storage_bytes.view(num_blocks, -1)",
-            "index_fill_",
-        )
-        if not all(fragment in helper_text for fragment in required_fragments):
-            raise RuntimeError(
-                f"Existing {HELPER_NAME} does not match the expected implementation"
-            )
-        return source, description
+    mode = path.stat().st_mode
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="", dir=path.parent, delete=False
+    ) as tmp:
+        tmp.write(new_text)
+        tmp_path = Path(tmp.name)
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
 
-    copy_func = functions.get("copy_kv_cache_blocks_inplace")
-    if copy_func is None:
-        raise RuntimeError("Could not find copy_kv_cache_blocks_inplace insertion point")
-
-    required_imports = {"Iterable", "Sequence", "np", "torch", "async_tensor_h2d"}
-    missing = required_imports - imported_names(tree)
-    if missing:
-        raise RuntimeError(
-            "Required imports are missing from vllm.v1.worker.utils: "
-            + ", ".join(sorted(missing))
-        )
-
-    insert_at = full_line_start(copy_func, source)
-    patched = apply_replacements(
-        source,
-        [(insert_at, insert_at, HELPER_SOURCE.encode("utf-8"))],
-    )
-    compile(patched.decode("utf-8"), filename, "exec")
-    verify_tree = ast.parse(patched.decode("utf-8"), filename=filename)
-    if HELPER_NAME not in top_level_functions(verify_tree):
-        raise RuntimeError("Helper insertion verification failed")
-    return patched, description
+    pycache = path.parent / "__pycache__"
+    if pycache.is_dir():
+        for cached in pycache.glob(f"{path.stem}.*.pyc"):
+            cached.unlink()
 
 
-def is_scheduler_zero_test(node: ast.expr) -> bool:
+def node_text(node: ast.AST) -> str:
+    return ast.unparse(node)
+
+
+def is_name_target(node: ast.AST, name: str) -> bool:
     return (
-        isinstance(node, ast.Attribute)
-        and node.attr == "new_block_ids_to_zero"
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "scheduler_output"
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == name
+        if isinstance(node, ast.Assign)
+        else isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == name
     )
 
 
-def call_name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Call):
-        if isinstance(node.func, ast.Name):
-            return node.func.id
-        if isinstance(node.func, ast.Attribute):
-            return node.func.attr
-    return None
-
-
-def contains_call(node: ast.AST, name: str) -> bool:
-    return any(call_name(child) == name for child in ast.walk(node))
-
-
-class ModelRunnerFinder(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.class_stack: list[str] = []
-        self.function_stack: list[str] = []
-        self.zero_if_nodes: list[ast.If] = []
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self.class_stack.append(node.name)
-        try:
-            self.generic_visit(node)
-        finally:
-            self.class_stack.pop()
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self.function_stack.append(node.name)
-        try:
-            self.generic_visit(node)
-        finally:
-            self.function_stack.pop()
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self.function_stack.append(node.name)
-        try:
-            self.generic_visit(node)
-        finally:
-            self.function_stack.pop()
-
-    def visit_If(self, node: ast.If) -> None:
-        if (
-            self.class_stack
-            and self.class_stack[-1] == "GPUModelRunner"
-            and self.function_stack
-            and self.function_stack[-1] == "update_requests"
-            and is_scheduler_zero_test(node.test)
-        ):
-            self.zero_if_nodes.append(node)
-        self.generic_visit(node)
-
-
-def patch_worker_utils_import(
-    source: bytes, tree: ast.Module
-) -> tuple[bytes, bool]:
-    matches = [
+def find_class_method(tree: ast.Module) -> ast.FunctionDef:
+    classes = [
         node
         for node in tree.body
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "vllm.v1.worker.utils"
+        if isinstance(node, ast.ClassDef) and node.name == "KVBlockZeroer"
     ]
+    if len(classes) != 1:
+        raise RuntimeError(f"expected one KVBlockZeroer class, found {len(classes)}")
+    methods = [
+        node
+        for node in classes[0].body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    ]
+    if len(methods) != 1:
+        raise RuntimeError(
+            f"expected one KVBlockZeroer.__init__, found {len(methods)}"
+        )
+    return methods[0]
+
+
+def find_layer_loop(init: ast.FunctionDef) -> ast.For:
+    matches: list[ast.For] = []
+    for node in ast.walk(init):
+        if not isinstance(node, ast.For):
+            continue
+        if not isinstance(node.target, ast.Name) or node.target.id != "layer_name":
+            continue
+        if node_text(node.iter) == "group.layer_names":
+            matches.append(node)
     if len(matches) != 1:
         raise RuntimeError(
-            "Expected one import from vllm.v1.worker.utils; "
+            f"expected one 'for layer_name in group.layer_names' loop, "
             f"found {len(matches)}"
         )
-    node = matches[0]
-    names = [alias.name for alias in node.names]
-    if HELPER_NAME in names:
-        return source, False
-    names.append(HELPER_NAME)
-    preferred_order = [
-        "KVBlockZeroer",
-        "copy_kv_cache_blocks_inplace",
-        HELPER_NAME,
+    return matches[0]
+
+
+def validate_old_loop(layer_loop: ast.For) -> tuple[ast.stmt, ast.stmt]:
+    body = layer_loop.body
+    dp_indexes = [
+        i
+        for i, node in enumerate(body)
+        if is_name_target(node, "dp") and node_text(node) == "dp = kv.data_ptr()"
     ]
-    ordered = [name for name in preferred_order if name in names]
-    ordered.extend(sorted(name for name in names if name not in ordered))
-    replacement = (
-        "from vllm.v1.worker.utils import (\n"
-        + "".join(f"    {name},\n" for name in ordered)
-        + ")"
-    ).encode("utf-8")
-    start, end = node_byte_span(node, source)
-    return apply_replacements(source, [(start, end, replacement)]), True
-
-
-def patch_model_runner(source: bytes, filename: str) -> tuple[bytes, str]:
-    description = "route packed KV caches through storage-aware block zeroing"
-    text = source.decode("utf-8")
-    tree = ast.parse(text, filename=filename)
-
-    finder = ModelRunnerFinder()
-    finder.visit(tree)
-    if len(finder.zero_if_nodes) != 1:
+    if len(dp_indexes) != 1:
         raise RuntimeError(
-            "Expected one new_block_ids_to_zero block in "
-            f"GPUModelRunner.update_requests; found {len(finder.zero_if_nodes)}"
+            f"expected one 'dp = kv.data_ptr()' in layer loop, found {len(dp_indexes)}"
         )
-    zero_if = finder.zero_if_nodes[0]
-    already_patched = contains_call(zero_if, HELPER_NAME)
+    start = dp_indexes[0]
+    expected = [
+        (ast.Assign, "dp = kv.data_ptr()"),
+        (ast.If, "if dp in seen_ptrs:\n    continue"),
+        (ast.Expr, "seen_ptrs.add(dp)"),
+        (ast.Assign, "el = kv.element_size()"),
+        (ast.Assign, "cur_bytes = kv.stride(block_dim) * el"),
+        (ast.Assert, "assert cur_bytes % 4 == 0"),
+        (ast.Assign, "kernel_block_el = cur_bytes // 4"),
+        (ast.Assign, "cur_page_el = kernel_block_el * ratio"),
+        (ast.If, None),
+        (ast.Assign, "block_stride_bytes = cur_bytes"),
+        (ast.Assign, None),
+        (ast.Assign, None),
+        (ast.For, None),
+    ]
+    candidate = body[start : start + len(expected)]
+    if len(candidate) != len(expected):
+        raise RuntimeError("KVBlockZeroer layer-loop body is shorter than expected")
+    for index, (node, (kind, exact)) in enumerate(zip(candidate, expected)):
+        if not isinstance(node, kind):
+            raise RuntimeError(
+                f"unexpected node {index} in zeroer sequence: "
+                f"expected {kind.__name__}, got {type(node).__name__}"
+            )
+        if exact is not None and node_text(node) != exact:
+            raise RuntimeError(
+                f"unexpected statement {index} in zeroer sequence: {node_text(node)!r}"
+            )
 
-    source_with_import, import_changed = patch_worker_utils_import(source, tree)
-    if already_patched:
-        if import_changed:
-            compile(source_with_import.decode("utf-8"), filename, "exec")
-            return source_with_import, description
-        return source, description
+    page_if = candidate[8]
+    assert isinstance(page_if, ast.If)
+    if node_text(page_if.test) != "page_size_el is None":
+        raise RuntimeError("unexpected page-size guard in KVBlockZeroer")
 
-    if not contains_call(zero_if, "zero_block_ids"):
-        raise RuntimeError(
-            "The original zeroing block does not call kv_block_zeroer.zero_block_ids"
-        )
+    outer_dims = candidate[10]
+    assert isinstance(outer_dims, ast.Assign)
+    if node_text(outer_dims.targets[0]) != "outer_dims":
+        raise RuntimeError("expected outer_dims assignment in KVBlockZeroer")
+    if "for d in range(block_dim)" not in node_text(outer_dims):
+        raise RuntimeError("unexpected outer_dims enumeration in KVBlockZeroer")
+    if "kv.stride(d) * el > block_stride_bytes" not in node_text(outer_dims):
+        raise RuntimeError("unexpected outer_dims stride filter in KVBlockZeroer")
 
-    # Reparse after changing the import so source positions remain correct.
-    text2 = source_with_import.decode("utf-8")
-    tree2 = ast.parse(text2, filename=filename)
-    finder2 = ModelRunnerFinder()
-    finder2.visit(tree2)
-    if len(finder2.zero_if_nodes) != 1:
-        raise RuntimeError("Could not relocate zeroing block after import patch")
-    zero_if2 = finder2.zero_if_nodes[0]
+    outer_strides = candidate[11]
+    assert isinstance(outer_strides, ast.Assign)
+    if node_text(outer_strides.targets[0]) != "outer_strides":
+        raise RuntimeError("expected outer_strides assignment in KVBlockZeroer")
 
-    indent = " " * zero_if2.col_offset
-    replacement = f'''{indent}if scheduler_output.new_block_ids_to_zero:
-{indent}    block_ids_to_zero = scheduler_output.new_block_ids_to_zero
-{indent}    if any(
-{indent}        tensor.block_stride > 0
-{indent}        for tensor in self.kv_cache_config.kv_cache_tensors
-{indent}    ):
-{indent}        zero_kv_cache_blocks_inplace(
-{indent}            self.kv_caches,
-{indent}            self.kv_cache_config.num_blocks,
-{indent}            block_ids_to_zero,
-{indent}        )
-{indent}    else:
-{indent}        assert self.kv_block_zeroer is not None
-{indent}        self.kv_block_zeroer.zero_block_ids(block_ids_to_zero)
-'''.encode("utf-8")
-    start = full_line_start(zero_if2, source_with_import)
-    end = full_line_end(zero_if2, source_with_import)
-    patched = apply_replacements(source_with_import, [(start, end, replacement)])
-    compile(patched.decode("utf-8"), filename, "exec")
-
-    verify_tree = ast.parse(patched.decode("utf-8"), filename=filename)
-    verify = ModelRunnerFinder()
-    verify.visit(verify_tree)
-    if len(verify.zero_if_nodes) != 1 or not contains_call(
-        verify.zero_if_nodes[0], HELPER_NAME
+    outer_loop = candidate[12]
+    assert isinstance(outer_loop, ast.For)
+    if not isinstance(outer_loop.target, ast.Name) or outer_loop.target.id != "outer":
+        raise RuntimeError("expected outer-segment loop in KVBlockZeroer")
+    if not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "seg_addrs"
+        and node.func.attr == "append"
+        and node.args
+        and node_text(node.args[0]) == "dp + off_bytes"
+        for node in ast.walk(outer_loop)
     ):
-        raise RuntimeError("Model runner semantic verification failed")
-    return patched, description
+        raise RuntimeError("expected seg_addrs.append(dp + off_bytes)")
+
+    return candidate[0], candidate[-1]
+
+
+def offset(lines: list[str], lineno: int, col: int) -> int:
+    return sum(len(line) for line in lines[: lineno - 1]) + col
 
 
 def main() -> None:
-    root = locate_vllm_root()
-    print(f"[{FIX_NAME}] vLLM root: {root}", flush=True)
-    utils_target = root / "v1" / "worker" / "utils.py"
-    runner_target = root / "v1" / "worker" / "gpu" / "model_runner.py"
-    try:
-        plans = [
-            make_plan(utils_target, patch_utils),
-            make_plan(runner_target, patch_model_runner),
-        ]
-        install_plans(FIX_NAME, plans)
-    except (UnicodeDecodeError, SyntaxError, RuntimeError) as exc:
-        raise SystemExit(f"[{FIX_NAME}] refusing to patch vLLM: {exc}") from exc
+    root = vllm_root()
+    path = root / TARGET
+    if not path.is_file():
+        raise RuntimeError(f"target file not found: {path}")
+
+    original = path.read_text(encoding="utf-8")
+    tree = ast.parse(original, filename=str(path))
+    init = find_class_method(tree)
+    layer_loop = find_layer_loop(init)
+
+    setup_old = [node for node in init.body if is_name_target(node, "seen_ptrs")]
+    setup_new = [
+        node for node in init.body if is_name_target(node, "packed_storage_strides")
+    ]
+    if len(setup_old) != 1:
+        raise RuntimeError(f"expected one seen_ptrs declaration, found {len(setup_old)}")
+    if len(setup_new) > 1:
+        raise RuntimeError(
+            f"expected at most one packed_storage_strides declaration, "
+            f"found {len(setup_new)}"
+        )
+
+    has_storage_logic = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "untyped_storage"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "kv"
+        for node in ast.walk(layer_loop)
+    )
+
+    if len(setup_new) == 1 and has_storage_logic:
+        print(f"[{NAME}] vLLM root: {root}")
+        print(f"[{NAME}] target: {path}")
+        print(f"[{NAME}] already applied")
+        return
+    if bool(setup_new) != has_storage_logic:
+        raise RuntimeError(f"partially applied packed KV zeroing fix in {path}")
+
+    old_start, old_end = validate_old_loop(layer_loop)
+    if old_start.end_lineno is None or old_end.end_lineno is None:
+        raise RuntimeError("Python AST does not provide end positions")
+
+    lines = original.splitlines(keepends=True)
+    loop_start = offset(lines, old_start.lineno, 0)
+    loop_end = offset(lines, old_end.end_lineno, old_end.end_col_offset)
+    if loop_end < len(original) and original[loop_end] == "\n":
+        loop_end += 1
+
+    seen_node = setup_old[0]
+    if seen_node.end_lineno is None:
+        raise RuntimeError("Python AST does not provide setup end position")
+    setup_pos = offset(lines, seen_node.end_lineno, seen_node.end_col_offset)
+    if setup_pos < len(original) and original[setup_pos] == "\n":
+        setup_pos += 1
+
+    edits = [
+        (loop_start, loop_end, NEW_LOOP),
+        (setup_pos, setup_pos, SETUP_LINE),
+    ]
+    updated = original
+    for start, end, replacement in sorted(edits, reverse=True):
+        updated = updated[:start] + replacement + updated[end:]
+
+    compile(updated, str(path), "exec")
+
+    # Verify the installed form structurally before writing it.
+    updated_tree = ast.parse(updated, filename=str(path))
+    updated_init = find_class_method(updated_tree)
+    updated_layer_loop = find_layer_loop(updated_init)
+    if not any(
+        is_name_target(node, "packed_storage_strides") for node in updated_init.body
+    ):
+        raise RuntimeError("updated source lacks packed_storage_strides")
+    if not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "untyped_storage"
+        for node in ast.walk(updated_layer_loop)
+    ):
+        raise RuntimeError("updated source lacks storage-aware zeroing logic")
+
+    print(f"[{NAME}] vLLM root: {root}")
+    print(f"[{NAME}] target: {path}")
+    before = sha256(original.encode())
+    install(path, updated)
+    after = sha256(path.read_bytes())
+    print(f"[{NAME}] before SHA256: {before}")
+    print(f"[{NAME}] installed SHA256: {after}")
+    print(
+        f"[{NAME}] applied: zero packed KV cache blocks from their physical "
+        "storage base"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"[{NAME}] ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

@@ -1,17 +1,15 @@
 # DGX Spark vLLM runtime fixes
 
-`run.sh` applies each patch independently and in a fixed order:
+`run-recipe.sh` copies this directory into the running container and invokes
+`run.sh`. The three Python scripts modify the installed vLLM package in place.
 
-1. `10-fix-deepgemm-warmup-scales.py` — initializes synthetic DeepGEMM warmup scales with `torch.ones` rather than uninitialized `torch.empty` memory.
-2. `20-fix-kv-zeroer-init.py` — initializes V2 KV-zeroing metadata for `fp8_ds_mla`.
-3. `30-fix-packed-kv-zeroing.py` — routes packed KV layouts through storage-aware physical-block zeroing rather than zeroing from offset view pointers.
+Files:
 
-Every patch is:
+- `10-fix-deepgemm-warmup-scales.py`
+- `20-fix-kv-zeroer-init.py`
+- `30-fix-packed-kv-zeroing.py`
+- `run.sh`
 
-- source-structure aware and refuses unexpected code;
-- idempotent;
-- atomically written with `.orig` backups;
-- post-write verified;
-- verbose about the fix, target file, and before/after SHA256 values.
-
-The package normally locates the installed `vllm` module automatically. For fixture testing, set `VLLM_ROOT` to the package directory that contains `model_executor/` and `v1/`.
+Each script uses exact source replacements and exits without changing its target
+when the installed source no longer matches the reviewed form. Existing `.orig`
+backups are preserved. No `.patch` files or `git` command are used.
