@@ -192,61 +192,7 @@ RUN set -eux; \
         echo "Final FlashInfer source after PR application: requested $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
 
-# TEMPORARY PATCH: FlashInfer PR #3738 narrowed native FP4 profiler workspace
-# allocation to the FP8-activation family. Native SM100+ NVFP4 MoE uses FP4
-# activations and FP4 weights, so autotune allocates null quant workspaces and
-# fails in prepareQuantParams(). Remove after the upstream FlashInfer fix lands.
-RUN python3 - <<'PY'
-from pathlib import Path
 
-target = Path("csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh")
-old_predicate = (
-    "  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();\n"
-)
-fixed_predicates = """  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();
-  // Native Blackwell NVFP4 uses FP4 activations and FP4 weights.
-  bool const is_native_wfp4afp4_family =
-      mSM >= 100 &&
-      (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
-      (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
-"""
-old_branch = "  if (is_native_wfp4afp8_family) {"
-fixed_branch = (
-    "  if (is_native_wfp4afp8_family || is_native_wfp4afp4_family) {"
-)
-
-if not target.exists():
-    raise SystemExit(f"{target} not found; cannot apply NVFP4 profiler patch")
-
-text = target.read_text()
-already_fixed = fixed_predicates in text and fixed_branch in text
-if already_fixed:
-    print("FlashInfer native NVFP4 profiler workaround already present; skipping")
-else:
-    if text.count(old_predicate) != 1 or text.count(old_branch) != 1:
-        raise SystemExit(
-            "Known FlashInfer PR #3738 profiler pattern not found exactly once; "
-            "refusing to apply an unverified patch"
-        )
-    text = text.replace(old_predicate, fixed_predicates, 1)
-    text = text.replace(old_branch, fixed_branch, 1)
-    target.write_text(text)
-    print("Applied FlashInfer native NVFP4 profiler workspace workaround")
-
-patched = target.read_text()
-if fixed_predicates not in patched or fixed_branch not in patched:
-    raise SystemExit("FlashInfer native NVFP4 profiler patch verification failed")
-PY
-
-# TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
-# RUN curl -fsL https://github.com/flashinfer-ai/flashinfer/pull/2927.diff -o pr2927.diff \
-#     && if git apply --reverse --check pr2927.diff 2>/dev/null; then \
-#          echo "PR #2927 already applied, skipping."; \
-#        else \
-#          echo "Applying FI PR #2927..."; \
-#          git apply -v pr2927.diff; \
-#        fi \
-#     && rm pr2927.diff
 
 # Apply patch to avoid re-downloading existing cubins
 COPY flashinfer_cache.patch .
