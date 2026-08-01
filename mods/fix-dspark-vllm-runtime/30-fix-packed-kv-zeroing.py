@@ -20,10 +20,11 @@ NEW_LOOP = '''                el = kv.element_size()
                 assert cur_bytes % 4 == 0
 
                 # Packed cache groups expose per-layer views into one shared,
-                # block-major storage slab. In that layout, cur_bytes is the
-                # complete physical scheduler-block stride, while
-                # spec.page_size_bytes is only this layer's logical page.
-                if cur_bytes > spec.page_size_bytes:
+                # block-major storage slab. cur_bytes is the physical stride
+                # for one kernel block; ratio maps a scheduler block to one or
+                # more kernel blocks. Compare complete scheduler-block sizes.
+                physical_page_bytes = cur_bytes * ratio
+                if physical_page_bytes > spec.page_size_bytes:
                     assert block_dim == 0, (
                         "Packed KV cache views must use a blocks-first layout"
                     )
@@ -31,44 +32,31 @@ NEW_LOOP = '''                el = kv.element_size()
                     storage_ptr = storage.data_ptr()
                     previous_stride = packed_storage_strides.get(storage_ptr)
                     if previous_stride is not None:
-                        assert previous_stride == cur_bytes, (
+                        assert previous_stride == physical_page_bytes, (
                             "Packed KV cache views sharing a storage allocation "
-                            f"have different block strides: {previous_stride} "
-                            f"vs {cur_bytes}"
+                            f"have different scheduler-block strides: "
+                            f"{previous_stride} vs {physical_page_bytes}"
                         )
                         continue
-                    assert storage.nbytes() % cur_bytes == 0, (
-                        "Packed KV cache storage must contain whole physical blocks"
+                    assert storage.nbytes() % physical_page_bytes == 0, (
+                        "Packed KV cache storage must contain whole physical "
+                        "scheduler blocks"
                     )
-                    packed_storage_strides[storage_ptr] = cur_bytes
-                    cur_page_el = cur_bytes // 4
-
-                    if page_size_el is None:
-                        page_size_el = cur_page_el
-                    else:
-                        assert page_size_el == cur_page_el, (
-                            f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
-                        )
+                    packed_storage_strides[storage_ptr] = physical_page_bytes
+                    cur_page_el = physical_page_bytes // 4
                     seg_addrs.append(storage_ptr)
+                    seg_page_sizes.append(cur_page_el)
                     continue
 
-                # Preserve the upstream path for ordinary cache allocations,
-                # including virtual block splitting and outer K/V enumeration.
+                # Preserve the upstream path for ordinary non-packed cache
+                # allocations, including virtual block splitting and outer
+                # K/V-buffer enumeration.
                 dp = kv.data_ptr()
                 if dp in seen_ptrs:
                     continue
                 seen_ptrs.add(dp)
-
                 kernel_block_el = cur_bytes // 4
                 cur_page_el = kernel_block_el * ratio
-
-                if page_size_el is None:
-                    page_size_el = cur_page_el
-                else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
-                    )
-
                 block_stride_bytes = cur_bytes
                 outer_dims = [
                     d
@@ -79,6 +67,7 @@ NEW_LOOP = '''                el = kv.element_size()
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                     seg_addrs.append(dp + off_bytes)
+                    seg_page_sizes.append(cur_page_el)
 '''
 
 
@@ -103,7 +92,7 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def install(path: Path, new_text: str) -> None:
+def install(path: Path, text: str) -> None:
     backup = path.with_name(path.name + ".orig")
     if not backup.exists():
         shutil.copy2(path, backup)
@@ -113,10 +102,10 @@ def install(path: Path, new_text: str) -> None:
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", newline="", dir=path.parent, delete=False
     ) as tmp:
-        tmp.write(new_text)
-        tmp_path = Path(tmp.name)
-    os.chmod(tmp_path, mode)
-    os.replace(tmp_path, path)
+        tmp.write(text)
+        temporary = Path(tmp.name)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
 
     pycache = path.parent / "__pycache__"
     if pycache.is_dir():
@@ -128,14 +117,14 @@ def node_text(node: ast.AST) -> str:
     return ast.unparse(node)
 
 
-def is_name_target(node: ast.AST, name: str) -> bool:
+def assignment_targets_name(node: ast.AST, name: str) -> bool:
+    if isinstance(node, ast.Assign):
+        return any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        )
     return (
-        isinstance(node, (ast.Assign, ast.AnnAssign))
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-        and node.targets[0].id == name
-        if isinstance(node, ast.Assign)
-        else isinstance(node, ast.AnnAssign)
+        isinstance(node, ast.AnnAssign)
         and isinstance(node.target, ast.Name)
         and node.target.id == name
     )
@@ -172,93 +161,123 @@ def find_layer_loop(init: ast.FunctionDef) -> ast.For:
             matches.append(node)
     if len(matches) != 1:
         raise RuntimeError(
-            f"expected one 'for layer_name in group.layer_names' loop, "
+            "expected one 'for layer_name in group.layer_names' loop, "
             f"found {len(matches)}"
         )
     return matches[0]
 
 
-def validate_old_loop(layer_loop: ast.For) -> tuple[ast.stmt, ast.stmt]:
-    body = layer_loop.body
-    dp_indexes = [
-        i
-        for i, node in enumerate(body)
-        if is_name_target(node, "dp") and node_text(node) == "dp = kv.data_ptr()"
-    ]
-    if len(dp_indexes) != 1:
-        raise RuntimeError(
-            f"expected one 'dp = kv.data_ptr()' in layer loop, found {len(dp_indexes)}"
-        )
-    start = dp_indexes[0]
-    expected = [
-        (ast.Assign, "dp = kv.data_ptr()"),
-        (ast.If, "if dp in seen_ptrs:\n    continue"),
-        (ast.Expr, "seen_ptrs.add(dp)"),
-        (ast.Assign, "el = kv.element_size()"),
-        (ast.Assign, "cur_bytes = kv.stride(block_dim) * el"),
-        (ast.Assert, "assert cur_bytes % 4 == 0"),
-        (ast.Assign, "kernel_block_el = cur_bytes // 4"),
-        (ast.Assign, "cur_page_el = kernel_block_el * ratio"),
-        (ast.If, None),
-        (ast.Assign, "block_stride_bytes = cur_bytes"),
-        (ast.Assign, None),
-        (ast.Assign, None),
-        (ast.For, None),
-    ]
-    candidate = body[start : start + len(expected)]
-    if len(candidate) != len(expected):
-        raise RuntimeError("KVBlockZeroer layer-loop body is shorter than expected")
-    for index, (node, (kind, exact)) in enumerate(zip(candidate, expected)):
-        if not isinstance(node, kind):
-            raise RuntimeError(
-                f"unexpected node {index} in zeroer sequence: "
-                f"expected {kind.__name__}, got {type(node).__name__}"
-            )
-        if exact is not None and node_text(node) != exact:
-            raise RuntimeError(
-                f"unexpected statement {index} in zeroer sequence: {node_text(node)!r}"
-            )
-
-    page_if = candidate[8]
-    assert isinstance(page_if, ast.If)
-    if node_text(page_if.test) != "page_size_el is None":
-        raise RuntimeError("unexpected page-size guard in KVBlockZeroer")
-
-    outer_dims = candidate[10]
-    assert isinstance(outer_dims, ast.Assign)
-    if node_text(outer_dims.targets[0]) != "outer_dims":
-        raise RuntimeError("expected outer_dims assignment in KVBlockZeroer")
-    if "for d in range(block_dim)" not in node_text(outer_dims):
-        raise RuntimeError("unexpected outer_dims enumeration in KVBlockZeroer")
-    if "kv.stride(d) * el > block_stride_bytes" not in node_text(outer_dims):
-        raise RuntimeError("unexpected outer_dims stride filter in KVBlockZeroer")
-
-    outer_strides = candidate[11]
-    assert isinstance(outer_strides, ast.Assign)
-    if node_text(outer_strides.targets[0]) != "outer_strides":
-        raise RuntimeError("expected outer_strides assignment in KVBlockZeroer")
-
-    outer_loop = candidate[12]
-    assert isinstance(outer_loop, ast.For)
-    if not isinstance(outer_loop.target, ast.Name) or outer_loop.target.id != "outer":
-        raise RuntimeError("expected outer-segment loop in KVBlockZeroer")
-    if not any(
+def call_is(
+    node: ast.AST,
+    receiver: str,
+    method: str,
+    argument: str | None = None,
+) -> bool:
+    if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "seg_addrs"
-        and node.func.attr == "append"
-        and node.args
-        and node_text(node.args[0]) == "dp + off_bytes"
-        for node in ast.walk(outer_loop)
+        and node.func.value.id == receiver
+        and node.func.attr == method
     ):
-        raise RuntimeError("expected seg_addrs.append(dp + off_bytes)")
+        return False
+    if argument is None:
+        return True
+    return len(node.args) == 1 and node_text(node.args[0]) == argument
 
-    return candidate[0], candidate[-1]
+
+def find_old_region(layer_loop: ast.For) -> tuple[ast.stmt, ast.stmt]:
+    body = layer_loop.body
+    starts = [
+        index
+        for index, node in enumerate(body)
+        if isinstance(node, ast.Assign)
+        and node_text(node) == "dp = kv.data_ptr()"
+    ]
+    if len(starts) != 1:
+        raise RuntimeError(
+            f"expected one 'dp = kv.data_ptr()' in layer loop, found {len(starts)}"
+        )
+    start = starts[0]
+
+    required_statements = {
+        "seen_ptrs.add(dp)",
+        "el = kv.element_size()",
+        "cur_bytes = kv.stride(block_dim) * el",
+        "kernel_block_el = cur_bytes // 4",
+        "cur_page_el = kernel_block_el * ratio",
+        "block_stride_bytes = cur_bytes",
+    }
+    rendered = {node_text(node) for node in body[start:]}
+    missing = sorted(required_statements - rendered)
+    if missing:
+        raise RuntimeError(f"unexpected KVBlockZeroer layer loop; missing {missing}")
+
+    outer_loops = [
+        node
+        for node in body[start:]
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "outer"
+    ]
+    if len(outer_loops) != 1:
+        raise RuntimeError(f"expected one outer-segment loop, found {len(outer_loops)}")
+    outer_loop = outer_loops[0]
+
+    has_addr = any(
+        call_is(node, "seg_addrs", "append", "dp + off_bytes")
+        for node in ast.walk(outer_loop)
+    )
+    has_size = any(
+        call_is(node, "seg_page_sizes", "append", "cur_page_el")
+        for node in ast.walk(outer_loop)
+    )
+    if not has_addr or not has_size:
+        raise RuntimeError(
+            "expected outer loop to append both segment address and page size"
+        )
+
+    return body[start], outer_loop
 
 
 def offset(lines: list[str], lineno: int, col: int) -> int:
     return sum(len(line) for line in lines[: lineno - 1]) + col
+
+
+def has_packed_logic(init: ast.FunctionDef, layer_loop: ast.For) -> bool:
+    setup = any(
+        assignment_targets_name(node, "packed_storage_strides")
+        for node in init.body
+    )
+    storage_call = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "untyped_storage"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "kv"
+        for node in ast.walk(layer_loop)
+    )
+    storage_addr = any(
+        call_is(node, "seg_addrs", "append", "storage_ptr")
+        for node in ast.walk(layer_loop)
+    )
+
+    # The ordinary upstream path already appends cur_page_el, so that call
+    # alone does not indicate that the packed-storage fix is present.
+    packed_markers = (setup, storage_call, storage_addr)
+    if packed_markers == (False, False, False):
+        return False
+    if packed_markers == (True, True, True):
+        storage_size = any(
+            call_is(node, "seg_page_sizes", "append", "cur_page_el")
+            for node in ast.walk(layer_loop)
+        )
+        if not storage_size:
+            raise RuntimeError(
+                "packed-storage path does not append its physical page size"
+            )
+        return True
+    raise RuntimeError("partially applied packed KV zeroing fix")
 
 
 def main() -> None:
@@ -272,38 +291,36 @@ def main() -> None:
     init = find_class_method(tree)
     layer_loop = find_layer_loop(init)
 
-    setup_old = [node for node in init.body if is_name_target(node, "seen_ptrs")]
-    setup_new = [
-        node for node in init.body if is_name_target(node, "packed_storage_strides")
+    seen_nodes = [
+        node
+        for node in init.body
+        if assignment_targets_name(node, "seen_ptrs")
     ]
-    if len(setup_old) != 1:
-        raise RuntimeError(f"expected one seen_ptrs declaration, found {len(setup_old)}")
-    if len(setup_new) > 1:
+    if len(seen_nodes) != 1:
         raise RuntimeError(
-            f"expected at most one packed_storage_strides declaration, "
-            f"found {len(setup_new)}"
+            f"expected one seen_ptrs declaration, found {len(seen_nodes)}"
         )
 
-    has_storage_logic = any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "untyped_storage"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "kv"
-        for node in ast.walk(layer_loop)
-    )
+    seg_size_nodes = [
+        node
+        for node in init.body
+        if assignment_targets_name(node, "seg_page_sizes")
+    ]
+    if len(seg_size_nodes) != 1:
+        raise RuntimeError(
+            f"expected one seg_page_sizes declaration, found {len(seg_size_nodes)}"
+        )
 
-    if len(setup_new) == 1 and has_storage_logic:
-        print(f"[{NAME}] vLLM root: {root}")
-        print(f"[{NAME}] target: {path}")
+    print(f"[{NAME}] vLLM root: {root}")
+    print(f"[{NAME}] target: {path}")
+
+    if has_packed_logic(init, layer_loop):
         print(f"[{NAME}] already applied")
         return
-    if bool(setup_new) != has_storage_logic:
-        raise RuntimeError(f"partially applied packed KV zeroing fix in {path}")
 
-    old_start, old_end = validate_old_loop(layer_loop)
-    if old_start.end_lineno is None or old_end.end_lineno is None:
-        raise RuntimeError("Python AST does not provide end positions")
+    old_start, old_end = find_old_region(layer_loop)
+    if old_end.end_lineno is None or old_end.end_col_offset is None:
+        raise RuntimeError("Python AST does not provide source end positions")
 
     lines = original.splitlines(keepends=True)
     loop_start = offset(lines, old_start.lineno, 0)
@@ -311,9 +328,9 @@ def main() -> None:
     if loop_end < len(original) and original[loop_end] == "\n":
         loop_end += 1
 
-    seen_node = setup_old[0]
-    if seen_node.end_lineno is None:
-        raise RuntimeError("Python AST does not provide setup end position")
+    seen_node = seen_nodes[0]
+    if seen_node.end_lineno is None or seen_node.end_col_offset is None:
+        raise RuntimeError("Python AST does not provide setup end positions")
     setup_pos = offset(lines, seen_node.end_lineno, seen_node.end_col_offset)
     if setup_pos < len(original) and original[setup_pos] == "\n":
         setup_pos += 1
@@ -322,38 +339,30 @@ def main() -> None:
         (loop_start, loop_end, NEW_LOOP),
         (setup_pos, setup_pos, SETUP_LINE),
     ]
+
     updated = original
-    for start, end, replacement in sorted(edits, reverse=True):
-        updated = updated[:start] + replacement + updated[end:]
+    for begin, end, replacement in sorted(edits, reverse=True):
+        updated = updated[:begin] + replacement + updated[end:]
 
     compile(updated, str(path), "exec")
-
-    # Verify the installed form structurally before writing it.
     updated_tree = ast.parse(updated, filename=str(path))
     updated_init = find_class_method(updated_tree)
     updated_layer_loop = find_layer_loop(updated_init)
-    if not any(
-        is_name_target(node, "packed_storage_strides") for node in updated_init.body
-    ):
-        raise RuntimeError("updated source lacks packed_storage_strides")
-    if not any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "untyped_storage"
-        for node in ast.walk(updated_layer_loop)
-    ):
-        raise RuntimeError("updated source lacks storage-aware zeroing logic")
+    if not has_packed_logic(updated_init, updated_layer_loop):
+        raise RuntimeError("post-patch packed-storage verification failed")
 
-    print(f"[{NAME}] vLLM root: {root}")
-    print(f"[{NAME}] target: {path}")
-    before = sha256(original.encode())
+    before = sha256(original.encode("utf-8"))
     install(path, updated)
-    after = sha256(path.read_bytes())
+    installed = path.read_text(encoding="utf-8")
+    if installed != updated:
+        raise RuntimeError("post-write verification failed")
+    after = sha256(installed.encode("utf-8"))
+
     print(f"[{NAME}] before SHA256: {before}")
     print(f"[{NAME}] installed SHA256: {after}")
     print(
-        f"[{NAME}] applied: zero packed KV cache blocks from their physical "
-        "storage base"
+        f"[{NAME}] applied: zero packed KV cache blocks once from their "
+        "physical storage base"
     )
 
 
@@ -363,3 +372,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[{NAME}] ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
+

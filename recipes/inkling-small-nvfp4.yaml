@@ -22,25 +22,37 @@ mods:
 
 # Default settings (can be overridden via CLI where supported)
 defaults:
-  port: 8000
+  port: 30000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.8
+  gpu_memory_utilization: 0.88
   max_model_len: 262144
   max_num_seqs: 2
   num_speculative_tokens: 1
+  max_num_batched_tokens: 4096
+
 
 # Environment variables
 env:
   LAMPORT_RS_SCONV: "0"
+
   VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
   VLLM_USE_AOT_COMPILE: "1"
+#  VLLM_LOGGING_LEVEL: "DEBUG"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: "1"
+
+  OMP_NUM_THREADS: "10"
+  MKL_NUM_THREADS: "10"
+  CUDA_SCALE_LAUNCH_QUEUES: "4x"
+  CUTE_DSL_ARCH: "sm_121a"
+
 
 # The vLLM serve command template
 command: |
   vllm serve thinkingmachines/Inkling-Small-NVFP4 \
-    --host {host} \
-    --port {port} \
+    --host {host} --port {port} \
+    -O3 --cudagraph-metrics  --enable-mfu-metrics \
     --trust-remote-code \
     --tokenizer-mode inkling \
     --tensor-parallel-size {tensor_parallel} \
@@ -49,11 +61,15 @@ command: |
     --reasoning-parser inkling \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
     --max-num-seqs {max_num_seqs} \
     --load-format instanttensor \
     --quantization nvfp4 \
     --enable-prefix-caching \
     --enable-chunked-prefill \
     --async-scheduling \
+    --default-chat-template-kwargs '{{"reasoning_effort":"max"}}' \
     --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
     --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
+
+
