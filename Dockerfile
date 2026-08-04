@@ -4,11 +4,21 @@
 ARG BUILD_JOBS=16
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
 ARG NCCL_NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
+ARG TORCH_VERSION=2.11.0
+ARG TORCHVISION_VERSION=""
+ARG TORCHAUDIO_VERSION=""
+ARG SPARKINFER_REPO=""
+ARG SPARKINFER_REF=""
+ARG SPARKINFER_CACHEBUST=""
 
 # =========================================================
 # STAGE 1: Base Build Image
 # =========================================================
 FROM ${CUDA_IMAGE} AS base
+
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
 
 # Build parallemism
 ARG BUILD_JOBS
@@ -53,8 +63,18 @@ RUN apt update && \
 
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
+     TORCHVISION_SPEC="torchvision" && \
+     TORCHAUDIO_SPEC="torchaudio" && \
+     if [ -n "$TORCHVISION_VERSION" ]; then TORCHVISION_SPEC="torchvision==$TORCHVISION_VERSION"; fi && \
+     if [ "$TORCHAUDIO_VERSION" = "none" ]; then \
+         TORCHAUDIO_SPEC=""; \
+     elif [ -n "$TORCHAUDIO_VERSION" ]; then \
+         TORCHAUDIO_SPEC="torchaudio==$TORCHAUDIO_VERSION"; \
+     fi && \
+     set -- "torch==$TORCH_VERSION" "$TORCHVISION_SPEC" && \
+     if [ -n "$TORCHAUDIO_SPEC" ]; then set -- "$@" "$TORCHAUDIO_SPEC"; fi && \
+     uv pip install "$@" triton --index-url https://download.pytorch.org/whl/cu130 && \
+     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi==0.1.12" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
 ENV PATH=/usr/lib/ccache:$PATH
@@ -208,8 +228,10 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     # flashinfer-jit-cache
     cd ../flashinfer-jit-cache && \
     uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
-    # dump git ref in the wheels dir
-    cd .. && git rev-parse HEAD > /workspace/wheels/.flashinfer-commit
+    # dump git ref and target architecture in the wheels dir
+    cd .. && \
+    git rev-parse HEAD > /workspace/wheels/.flashinfer-commit && \
+    printf '%s\n' "$FLASHINFER_CUDA_ARCH_LIST" > /workspace/wheels/.flashinfer-arch
 
 # =========================================================
 # STAGE 3: FlashInfer Wheel Export
@@ -243,6 +265,8 @@ WORKDIR $VLLM_BASE_DIR
 ARG CACHEBUST_VLLM=1
 
 # Git reference (branch, tag, or SHA) to checkout
+ARG VLLM_UPSTREAM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_REF=main
 
 # Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
@@ -251,29 +275,46 @@ ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
 ARG DEEPGEMM_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
 ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 
-# Smart Git Clone (Fetch changes instead of full re-clone)
+# The upstream repository uses the shared checkout cache. Custom repositories
+# are cloned outside it so a fork can never reuse or mutate the upstream clone.
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
-    echo "CACHEBUST_VLLM=${CACHEBUST_VLLM}" && \
-    cd /repo-cache && \
-    if [ ! -d "vllm" ]; then \
-        echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
-        if [ "$VLLM_REF" != "main" ]; then \
-            cd vllm && \
-            git checkout ${VLLM_REF}; \
+    set -eux; \
+    echo "CACHEBUST_VLLM=${CACHEBUST_VLLM}"; \
+    if [ "$VLLM_REPO" != "$VLLM_UPSTREAM_REPO" ]; then \
+        echo "Custom vLLM repository selected; bypassing shared checkout cache."; \
+        git clone --recursive "$VLLM_REPO" /tmp/vllm-custom; \
+        cd /tmp/vllm-custom; \
+        if git rev-parse --verify --quiet "refs/remotes/origin/$VLLM_REF"; then \
+            git checkout --detach "origin/$VLLM_REF"; \
+        else \
+            git checkout --detach "$VLLM_REF"; \
         fi; \
+        git submodule update --init --recursive; \
+        cp -a /tmp/vllm-custom "$VLLM_BASE_DIR/vllm"; \
     else \
-        echo "Cache hit: Fetching updates..." && \
-        cd vllm && \
-        git fetch origin && \
-        git fetch origin --tags --force && \
-        (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
-        git reset --hard HEAD && \
-        git submodule update --init --recursive && \
-        git clean -fdx && \
+        cd /repo-cache; \
+        if [ ! -d "vllm" ]; then \
+            echo "Cache miss: Cloning vLLM from scratch..."; \
+            git clone --recursive "$VLLM_REPO" vllm; \
+        else \
+            echo "Cache hit: Fetching updates..."; \
+            cd vllm; \
+            git fetch origin; \
+            git fetch origin --tags --force; \
+            cd ..; \
+        fi; \
+        cd vllm; \
+        if git rev-parse --verify --quiet "refs/remotes/origin/$VLLM_REF"; then \
+            git checkout --detach "origin/$VLLM_REF"; \
+        else \
+            git checkout --detach "$VLLM_REF"; \
+        fi; \
+        git reset --hard HEAD; \
+        git submodule update --init --recursive; \
+        git clean -fdx; \
         git gc --auto; \
-    fi && \
-    cp -a /repo-cache/vllm $VLLM_BASE_DIR/
+        cp -a /repo-cache/vllm "$VLLM_BASE_DIR/"; \
+    fi
 
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     set -eux; \
@@ -303,6 +344,7 @@ WORKDIR $VLLM_BASE_DIR/vllm
 ARG VLLM_PRESET_PRS="47392"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
+ARG VLLM_PRESERVE_SM12X_TARGET=0
 
 # PR refs include the branch history they were developed on. Use upstream main
 # only to identify each PR's patch range, then apply that patch to VLLM_REF.
@@ -337,21 +379,23 @@ RUN set -eux; \
         git config --global user.name "Docker Builder"; \
         \
         echo "Applying PR patches to vLLM ref $VLLM_REF ($VLLM_REQUESTED_HEAD): $VLLM_ALL_PRS"; \
-        echo "Fetching origin/main only to calculate PR patch ranges; current checkout remains $VLLM_REF."; \
-        git fetch origin +refs/heads/main:refs/remotes/origin/main; \
+        echo "Fetching upstream main only to calculate PR patch ranges; current checkout remains $VLLM_REF."; \
+        git remote remove vllm-upstream >/dev/null 2>&1 || true; \
+        git remote add vllm-upstream "$VLLM_UPSTREAM_REPO"; \
+        git fetch vllm-upstream +refs/heads/main:refs/remotes/vllm-upstream/main; \
         for pr in $VLLM_ALL_PRS; do \
             echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
-            git fetch origin +pull/${pr}/head:pr-${pr}; \
-            pr_base="$(git merge-base origin/main pr-${pr} || true)"; \
+            git fetch vllm-upstream +pull/${pr}/head:pr-${pr}; \
+            pr_base="$(git merge-base vllm-upstream/main pr-${pr} || true)"; \
             if [ -z "$pr_base" ]; then \
-                echo "Unable to find an origin/main merge-base for PR #$pr."; \
+                echo "Unable to find an upstream main merge-base for PR #$pr."; \
                 exit 1; \
             fi; \
             patch_file="/tmp/pr-${pr}.patch"; \
             echo "PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
             git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
             if [ ! -s "$patch_file" ]; then \
-                echo "PR #$pr has no patch relative to origin/main; skipping."; \
+                echo "PR #$pr has no patch relative to upstream main; skipping."; \
                 rm -f "$patch_file"; \
                 continue; \
             fi; \
@@ -456,6 +500,44 @@ else:
             "Unknown is_padding-aware topk_hash_softplus_sqrt layout; "
             "refusing to guess whether vLLM PR #49408 is fixed"
         )
+PY
+
+# CUDA 13 vLLM builds normally collapse a requested 12.1a target to the
+# generic 12.0 entry. Adding 12.1 to the supported set preserves the selected
+# SM12x target through CMake's intersection logic: 12.1a remains 12.1a, while
+# explicitly selected 12.0a and 12.0f targets remain unchanged. Keep this
+# opt-in so the standard upstream build retains its own architecture policy.
+RUN VLLM_PRESERVE_SM12X_TARGET="${VLLM_PRESERVE_SM12X_TARGET}" python3 - <<'PY'
+import os
+from pathlib import Path
+
+if os.environ["VLLM_PRESERVE_SM12X_TARGET"] not in {
+    "1", "true", "TRUE", "yes", "YES"
+}:
+    print("SM12x target preservation not requested; skipping")
+    raise SystemExit(0)
+
+target = Path("CMakeLists.txt")
+cuda13_default = (
+    'set(CUDA_SUPPORTED_ARCHS '
+    '"7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")'
+)
+cuda13_sm121 = (
+    'set(CUDA_SUPPORTED_ARCHS '
+    '"7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0;12.1")'
+)
+
+text = target.read_text()
+if cuda13_sm121 in text:
+    print("CUDA 13 SM12x subarchitecture allow-list already present; skipping")
+elif text.count(cuda13_default) == 1:
+    target.write_text(text.replace(cuda13_default, cuda13_sm121, 1))
+    print("Enabled selected SM12x target preservation for CUDA 13 vLLM build")
+else:
+    raise SystemExit(
+        "Unable to preserve the selected SM12x target: expected CUDA 13 "
+        "CUDA_SUPPORTED_ARCHS entry was not found exactly once"
+    )
 PY
 
 # TEMPORARY PATCH: vLLM PR #47914 added per-KV-group causal metadata by
@@ -889,7 +971,8 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
 # Dump git refs in the wheels dir.
 RUN \
     git rev-parse HEAD > /workspace/wheels/.vllm-commit && \
-    git -C "$DEEPGEMM_SRC_DIR" rev-parse HEAD > /workspace/wheels/.deepgemm-commit
+    git -C "$DEEPGEMM_SRC_DIR" rev-parse HEAD > /workspace/wheels/.deepgemm-commit && \
+    printf '%s\n' "$TORCH_CUDA_ARCH_LIST" > /workspace/wheels/.vllm-arch
 
 # =========================================================
 # STAGE 5: vLLM Wheel Export
@@ -898,9 +981,16 @@ FROM scratch AS vllm-export
 COPY --from=vllm-builder /workspace/wheels /
 
 # =========================================================
-# STAGE 6: Runner (Installs wheels from host ./wheels/)
+# STAGE 6: Runner (Installs wheels from selected named contexts)
 # =========================================================
 FROM ${CUDA_IMAGE} AS runner
+
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+ARG SPARKINFER_REPO
+ARG SPARKINFER_REF
+ARG SPARKINFER_CACHEBUST
 
 # Transferring build settings from build image because of ptxas/jit compilation during vLLM startup
 # Build parallemism
@@ -949,22 +1039,39 @@ ARG PRE_TRANSFORMERS=0
 
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
+     TORCHVISION_SPEC="torchvision" && \
+     TORCHAUDIO_SPEC="torchaudio" && \
+     if [ -n "$TORCHVISION_VERSION" ]; then TORCHVISION_SPEC="torchvision==$TORCHVISION_VERSION"; fi && \
+     if [ "$TORCHAUDIO_VERSION" = "none" ]; then \
+         TORCHAUDIO_SPEC=""; \
+     elif [ -n "$TORCHAUDIO_VERSION" ]; then \
+         TORCHAUDIO_SPEC="torchaudio==$TORCHAUDIO_VERSION"; \
+     fi && \
+     set -- "torch==$TORCH_VERSION" "$TORCHVISION_SPEC" && \
+     if [ -n "$TORCHAUDIO_SPEC" ]; then set -- "$@" "$TORCHAUDIO_SPEC"; fi && \
+     uv pip install "$@" triton --index-url https://download.pytorch.org/whl/cu130 && \
+     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi==0.1.12"
 
-# Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
+# Install the shared/selected FlashInfer and vLLM profiles from independent
+# named contexts (bind-mounted without adding the wheel files to an image layer).
 # PRE_TRANSFORMERS=1 is retained for manual legacy builds; build-and-copy.sh no longer sets it for --tf5.
 # FastAPI 0.137.0 adds _IncludedRouter entries that currently break
 # prometheus-fastapi-instrumentator route name lookup.
-RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
+RUN --mount=type=bind,from=flashinfer_wheels,target=/workspace/flashinfer-wheels \
+    --mount=type=bind,from=vllm_wheels,target=/workspace/vllm-wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
+    PINNED_TORCHVISION=$(python3 -c "import importlib.metadata as m; print(m.version('torchvision'))") && \
+    PINNED_TORCHAUDIO=$(python3 -c "import importlib.metadata as m; print(m.version('torchaudio'))" 2>/dev/null || true) && \
     echo "torch==${PINNED_TORCH}" > /tmp/wheel-override.txt && \
+    echo "torchvision==${PINNED_TORCHVISION}" >> /tmp/wheel-override.txt && \
+    if [ -n "$PINNED_TORCHAUDIO" ]; then echo "torchaudio==${PINNED_TORCHAUDIO}" >> /tmp/wheel-override.txt; fi && \
     echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/wheel-override.txt && \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
         echo "transformers>=5.0.0" >> /tmp/wheel-override.txt; \
     fi && \
-    uv pip install /workspace/wheels/*.whl --override /tmp/wheel-override.txt
+    uv pip install /workspace/flashinfer-wheels/*.whl /workspace/vllm-wheels/*.whl \
+        --override /tmp/wheel-override.txt
 
 # Setup environment for runtime
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
@@ -981,10 +1088,35 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 # a re-resolve that swaps the CUDA-built torch for PyPI's CPU wheel.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
+    PINNED_TORCHVISION=$(python3 -c "import importlib.metadata as m; print(m.version('torchvision'))") && \
+    PINNED_TORCHAUDIO=$(python3 -c "import importlib.metadata as m; print(m.version('torchaudio'))" 2>/dev/null || true) && \
     echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
+    echo "torchvision==${PINNED_TORCHVISION}" >> /tmp/torch-override.txt && \
+    if [ -n "$PINNED_TORCHAUDIO" ]; then echo "torchaudio==${PINNED_TORCHAUDIO}" >> /tmp/torch-override.txt; fi && \
     echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
     uv pip install ray[default] fastsafetensors instanttensor \
         --override /tmp/torch-override.txt
+
+# The local-inference-lab vLLM fork consumes the external SparkInfer kernel package
+# (formerly named B12X)
+# at runtime. Keep this opt-in so ordinary vLLM/Torch 2.11 images do not pull a
+# package that requires Torch 2.12. Build SparkInfer from its source repository but
+# install it without dependencies: vLLM already provides the runtime packages
+# and pins API-sensitive components such as nvidia-cutlass-dsl. SparkInfer kernels
+# remain JIT-compiled on first use; building its Python wheel here does not
+# compile the CUDA kernels.
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    if [ -n "$SPARKINFER_REPO" ]; then \
+        echo "Refreshing SparkInfer source (cache key: $SPARKINFER_CACHEBUST)" && \
+        git clone --depth 1 --branch "$SPARKINFER_REF" "$SPARKINFER_REPO" /tmp/sparkinfer-source && \
+        SPARKINFER_COMMIT=$(git -C /tmp/sparkinfer-source rev-parse HEAD) && \
+        uv pip install --reinstall --no-deps /tmp/sparkinfer-source && \
+        printf '%s\n' "$SPARKINFER_COMMIT" > /workspace/sparkinfer-source-commit && \
+        python3 -c "import importlib.metadata as m, sys; import sparkinfer; print('Verified SparkInfer', m.version('sparkinfer'), 'from source commit', sys.argv[1], 'with CUTLASS DSL', m.version('nvidia-cutlass-dsl'))" "$SPARKINFER_COMMIT" && \
+        rm -rf /tmp/sparkinfer-source; \
+    else \
+        echo "SparkInfer source build not requested; skipping."; \
+    fi
 
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \

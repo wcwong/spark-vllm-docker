@@ -48,9 +48,18 @@ setup_fixture() {
     cp "$PROJECT_DIR/autodiscover.sh" "$FIXTURE_DIR/"
     cp "$PROJECT_DIR/Dockerfile" "$FIXTURE_DIR/"
     cp "$PROJECT_DIR/Dockerfile.mxfp4" "$FIXTURE_DIR/"
-    mkdir -p "$FIXTURE_DIR/wheels"
-    touch "$FIXTURE_DIR/wheels/flashinfer-test.whl"
-    touch "$FIXTURE_DIR/wheels/vllm-test.whl"
+    mkdir -p \
+        "$FIXTURE_DIR/.wheel-cache/flashinfer/regular" \
+        "$FIXTURE_DIR/.wheel-cache/flashinfer/custom" \
+        "$FIXTURE_DIR/.wheel-cache/vllm/regular" \
+        "$FIXTURE_DIR/.wheel-cache/vllm/b12x" \
+        "$FIXTURE_DIR/.wheel-cache/vllm/custom"
+    touch \
+        "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_cubin-test.whl" \
+        "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache-test.whl" \
+        "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_python-test.whl" \
+        "$FIXTURE_DIR/.wheel-cache/vllm/regular/vllm-test.whl" \
+        "$FIXTURE_DIR/.wheel-cache/vllm/b12x/vllm-test.whl"
     touch "$FIXTURE_DIR/test.env"
     : > "$TEST_LOG"
     : > "$OUTPUT_LOG"
@@ -59,6 +68,48 @@ setup_fixture() {
 #!/bin/bash
 set -euo pipefail
 echo "docker $*" >> "$TEST_LOG"
+if [ "${1:-}" = "build" ]; then
+    (
+        target=""
+        output=""
+        build_arch="12.1a"
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --target) target="$2"; shift 2 ;;
+                --output) output="$2"; shift 2 ;;
+                --build-arg)
+                    case "$2" in
+                        TORCH_CUDA_ARCH_LIST=*) build_arch="${2#TORCH_CUDA_ARCH_LIST=}" ;;
+                        FLASHINFER_CUDA_ARCH_LIST=*) build_arch="${2#FLASHINFER_CUDA_ARCH_LIST=}" ;;
+                    esac
+                    shift 2
+                    ;;
+                *) shift ;;
+            esac
+        done
+        case "$output" in
+            type=local,dest=*)
+                dest="${output#type=local,dest=}"
+                mkdir -p "$dest"
+                case "$target" in
+                    flashinfer-export)
+                        printf 'fake wheel\n' > "$dest/flashinfer_cubin-built.whl"
+                        printf 'fake wheel\n' > "$dest/flashinfer_jit_cache-built.whl"
+                        printf 'fake wheel\n' > "$dest/flashinfer_python-built.whl"
+                        printf 'flashinfer-commit\n' > "$dest/.flashinfer-commit"
+                        printf '%s\n' "$build_arch" > "$dest/.flashinfer-arch"
+                        ;;
+                    vllm-export)
+                        printf 'fake wheel\n' > "$dest/vllm-built.whl"
+                        printf 'vllm-commit\n' > "$dest/.vllm-commit"
+                        printf 'deepgemm-commit\n' > "$dest/.deepgemm-commit"
+                        printf '%s\n' "$build_arch" > "$dest/.vllm-arch"
+                        ;;
+                esac
+                ;;
+        esac
+    )
+fi
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
     echo "${LOCAL_IMAGE_ID:-sha256:local}"
     exit 0
@@ -182,9 +233,78 @@ test_non_default_gpu_arch_uses_wheel_build() {
     setup_fixture
     run_build --gpu-arch 12.0f || fail "non-default gpu arch run failed"
     assert_log_not_contains '^docker pull eugr/spark-vllm:latest$'
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=12.0f '
     assert_log_contains '^docker build -t vllm-node '
     assert_log_contains 'NCCL_NVCC_GENCODE=-gencode=arch=compute_120,code=sm_120'
-    pass "non-default gpu arch uses wheel build path"
+    assert_output_contains 'Rebuilding FlashInfer wheels for GPU architecture 12\.0f\.\.\.'
+    pass "non-default gpu arch rebuilds FlashInfer for regular builds"
+}
+
+test_default_prebuilt_ignores_local_flashinfer_arch() {
+    setup_fixture
+    printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/.flashinfer-arch"
+    run_build || fail "default run with alternate local FlashInfer cache failed"
+    assert_log_contains '^docker pull eugr/spark-vllm:latest$'
+    assert_log_not_contains '^docker build --target flashinfer-export '
+    pass "default prebuilt image ignores the unused local FlashInfer cache"
+}
+
+test_regular_build_rebuilds_mismatched_cached_flashinfer_arch() {
+    setup_fixture
+    printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/.flashinfer-arch"
+    run_build --rebuild-vllm || fail "regular cached-arch build failed"
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a '
+    assert_output_contains 'Rebuilding FlashInfer wheels for GPU architecture 12\.1a\.\.\.'
+    pass "regular builds do not reuse FlashInfer wheels for another architecture"
+}
+
+test_regular_build_reuses_matching_cached_flashinfer_arch() {
+    setup_fixture
+    touch \
+        "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/flashinfer_cubin-test.whl" \
+        "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/flashinfer_jit_cache-test.whl" \
+        "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/flashinfer_python-test.whl"
+    printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/.flashinfer-arch"
+    run_build --gpu-arch 12.0f || fail "regular matching cached-arch build failed"
+    assert_log_not_contains '^docker build --target flashinfer-export '
+    assert_log_contains '^docker build -t vllm-node '
+    pass "regular builds can reuse FlashInfer wheels for the selected architecture"
+}
+
+test_use_wheels_rejects_mismatched_flashinfer_arch() {
+    setup_fixture
+    printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/.flashinfer-arch"
+    if run_build --use-wheels; then
+        fail "--use-wheels unexpectedly accepted mismatched FlashInfer wheels"
+    fi
+    assert_log_not_contains '^docker build --target flashinfer-export '
+    assert_output_contains 'Error: Cached FlashInfer wheels do not match GPU architecture 12\.1a\.'
+    assert_output_contains 'Re-run with --rebuild-flashinfer or provide matching wheels with a \.flashinfer-arch marker\.'
+    pass "--use-wheels rejects a mismatched FlashInfer wheel cache"
+}
+
+test_use_wheels_rejects_mismatched_vllm_arch() {
+    setup_fixture
+    printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/vllm/regular/.vllm-arch"
+    if run_build --use-wheels; then
+        fail "--use-wheels unexpectedly accepted a mismatched vLLM wheel"
+    fi
+    assert_log_not_contains '^docker build --target vllm-export '
+    assert_output_contains 'Error: Cached regular vLLM wheel does not match GPU architecture 12\.1a\.'
+    pass "--use-wheels rejects a mismatched vLLM wheel cache"
+}
+
+test_use_wheels_non_default_empty_cache_skips_downloads() {
+    setup_fixture
+    rm -f "$FIXTURE_DIR/.wheel-cache/flashinfer/custom"/*.whl \
+        "$FIXTURE_DIR/.wheel-cache/vllm/custom"/*.whl
+    if run_build --use-wheels --gpu-arch 12.0f --force-download; then
+        fail "--use-wheels unexpectedly accepted an empty non-default wheel cache"
+    fi
+    assert_log_not_contains '^curl '
+    assert_log_not_contains '^docker build'
+    assert_output_contains 'Error: Cached FlashInfer wheels do not match GPU architecture 12\.0f\.'
+    pass "--use-wheels skips downloads for an empty non-default wheel cache"
 }
 
 test_use_wheels_uses_wheel_build() {
@@ -200,7 +320,8 @@ test_use_wheels_uses_wheel_build() {
 
 test_use_wheels_never_falls_back_to_source() {
     setup_fixture
-    rm -f "$FIXTURE_DIR/wheels/flashinfer-test.whl" "$FIXTURE_DIR/wheels/vllm-test.whl"
+    rm -f "$FIXTURE_DIR/.wheel-cache/flashinfer/regular"/*.whl \
+        "$FIXTURE_DIR/.wheel-cache/vllm/regular"/*.whl
     if run_build --use-wheels; then
         fail "--use-wheels unexpectedly succeeded without precompiled wheels"
     fi
@@ -214,7 +335,7 @@ test_use_wheels_never_falls_back_to_source() {
 
 test_use_wheels_never_builds_missing_vllm_implicitly() {
     setup_fixture
-    rm -f "$FIXTURE_DIR/wheels/vllm-test.whl"
+    rm -f "$FIXTURE_DIR/.wheel-cache/vllm/regular"/*.whl
     if run_build --use-wheels; then
         fail "--use-wheels unexpectedly succeeded without a precompiled vLLM wheel"
     fi
@@ -309,6 +430,7 @@ test_flashinfer_ref_forwards_selected_ref() {
     setup_fixture
     run_build --flashinfer-ref 0123456789abcdef || fail "--flashinfer-ref run failed"
     assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=0123456789abcdef'
+    assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/custom --build-context vllm_wheels=\./\.wheel-cache/vllm/regular '
     assert_output_contains 'Rebuilding FlashInfer wheels \(--flashinfer-ref specified\)\.\.\.'
     pass "--flashinfer-ref forwards selected ref"
 }
@@ -327,7 +449,7 @@ test_vllm_ref_skips_preset_prs_by_default() {
     run_build --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8 || fail "--vllm-ref run failed"
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=ab666069935c1f23e8ef56038b4659ac9e8f19f8 .*--build-arg VLLM_APPLY_PRESET_PRS=0'
     assert_log_not_contains 'VLLM_APPLY_PRESET_PRS=1'
-    assert_output_contains 'Skipping preset vLLM PRs because --vllm-ref or --apply-vllm-pr was specified\.'
+    assert_output_contains 'Skipping preset vLLM PRs because --vllm-repo, --vllm-ref, or --apply-vllm-pr was specified\.'
     pass "--vllm-ref forwards preset PR opt-out by default"
 }
 
@@ -343,7 +465,7 @@ test_apply_vllm_pr_skips_preset_prs_by_default() {
     setup_fixture
     run_build --apply-vllm-pr 12345 || fail "--apply-vllm-pr run failed"
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRS=12345'
-    assert_output_contains 'Skipping preset vLLM PRs because --vllm-ref or --apply-vllm-pr was specified\.'
+    assert_output_contains 'Skipping preset vLLM PRs because --vllm-repo, --vllm-ref, or --apply-vllm-pr was specified\.'
     pass "--apply-vllm-pr suppresses preset PRs by default"
 }
 
@@ -379,6 +501,250 @@ test_requested_vllm_prs_apply_to_selected_vllm_ref() {
     assert_output_contains 'Rebuilding vLLM wheels \(applying vLLM PRs to --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8\)\.\.\.'
     assert_output_contains 'Applying vLLM PRs: 12345'
     pass "--apply-vllm-pr applies requested PRs to selected ref"
+}
+
+test_custom_vllm_repo_forces_source_build() {
+    setup_fixture
+    run_build --vllm-repo https://github.com/example/vllm.git || fail "--vllm-repo run failed"
+    assert_log_not_contains '^docker pull eugr/spark-vllm:latest$'
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main --build-arg VLLM_REPO=https://github.com/example/vllm.git --build-arg VLLM_APPLY_PRESET_PRS=0'
+    assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/custom '
+    assert_log_not_contains 'SPARKINFER_REPO='
+    assert_output_contains 'Rebuilding vLLM wheels \(--vllm-repo specified\)\.\.\.'
+    assert_output_contains 'Skipping preset vLLM PRs because --vllm-repo, --vllm-ref, or --apply-vllm-pr was specified\.'
+    pass "--vllm-repo forces a source build and suppresses upstream preset PRs"
+}
+
+test_exp_b12x_uses_prebuilt_image() {
+    setup_fixture
+    run_build --exp-b12x || fail "--exp-b12x run failed"
+    assert_log_contains '^docker pull eugr/spark-vllm-b12x:latest$'
+    assert_log_contains '^docker tag eugr/spark-vllm-b12x:latest vllm-node-b12x$'
+    assert_log_not_contains '^docker build'
+    pass "--exp-b12x pulls and tags the tested B12X image"
+}
+
+test_exp_b12x_rebuild_vllm_uses_preset_source_build() {
+    setup_fixture
+    run_build --exp-b12x --rebuild-vllm || fail "--exp-b12x --rebuild-vllm run failed"
+    assert_log_not_contains '^docker pull eugr/spark-vllm-b12x:latest$'
+    assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a --build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a .*--build-arg TORCH_VERSION=2.12.0 --build-arg TORCHVISION_VERSION=0.27.0 --build-arg TORCHAUDIO_VERSION=none .*--build-arg VLLM_REF=dev/gilded-gnosis --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1'
+    assert_log_contains '^docker build -t vllm-node-b12x .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/b12x .*--build-arg SPARKINFER_REPO=https://github.com/lukealonso/b12x.git --build-arg SPARKINFER_REF=master '
+    assert_log_contains '.*--build-arg SPARKINFER_CACHEBUST=[0-9]+'
+    assert_log_not_contains 'Dockerfile\.mxfp4'
+    assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset\)\.\.\.'
+    assert_output_contains 'Building SparkInfer from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/local-inference-lab/vllm ref dev/gilded-gnosis\.'
+    pass "--exp-b12x --rebuild-vllm uses the B12X source-build profile"
+}
+
+test_exp_b12x_allows_vllm_prs() {
+    setup_fixture
+    run_build --exp-b12x --apply-vllm-pr 12345 || fail "--exp-b12x with vLLM PR run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=dev/gilded-gnosis --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 --build-arg CACHEBUST_VLLM=[0-9]+ --build-arg VLLM_PRS=12345'
+    assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset with requested vLLM PRs\)\.\.\.'
+    assert_output_contains 'Applying vLLM PRs: 12345'
+    pass "--exp-b12x accepts additional vLLM PR patches"
+}
+
+test_exp_b12x_respects_custom_tag() {
+    setup_fixture
+    run_build --exp-b12x -t custom-b12x || fail "--exp-b12x custom-tag run failed"
+    assert_log_contains '^docker pull eugr/spark-vllm-b12x:latest$'
+    assert_log_contains '^docker tag eugr/spark-vllm-b12x:latest custom-b12x$'
+    assert_log_not_contains '^docker build'
+    pass "an explicit tag overrides the --exp-b12x default tag"
+}
+
+test_exp_b12x_rejects_use_wheels() {
+    setup_fixture
+    if run_build --exp-b12x --use-wheels; then
+        fail "--exp-b12x unexpectedly accepted --use-wheels"
+    fi
+    assert_log_not_contains '^docker pull '
+    assert_log_not_contains '^docker build'
+    assert_output_contains 'Error: --exp-b12x is incompatible with --use-wheels because B12X vLLM wheels are not published'
+    pass "--exp-b12x rejects the unsupported wheel-only path"
+}
+
+test_exp_b12x_rejects_preset_overrides() {
+    setup_fixture
+    if run_build --exp-b12x --vllm-ref main; then
+        fail "--exp-b12x unexpectedly accepted --vllm-ref"
+    fi
+    assert_log_not_contains '^docker build'
+    assert_output_contains 'Error: --exp-b12x is incompatible with --vllm-ref'
+
+    setup_fixture
+    if run_build --exp-b12x --exp-mxfp4; then
+        fail "--exp-b12x unexpectedly accepted --exp-mxfp4"
+    fi
+    assert_log_not_contains '^docker build'
+    assert_output_contains 'Error: --exp-b12x is incompatible with --exp-mxfp4'
+    pass "--exp-b12x rejects conflicting build presets and overrides"
+}
+
+test_exp_b12x_variable_names_are_generic() {
+    if grep -q 'FATHOMLESS_' "$PROJECT_DIR/build-and-copy.sh"; then
+        fail "build-and-copy.sh still contains FATHOMLESS-prefixed variables"
+    fi
+    for expected in \
+        'EXP_B12X_VLLM_REPO=' \
+        'EXP_B12X_VLLM_REF=' \
+        'EXP_B12X_PACKAGE_REPO=' \
+        'EXP_B12X_PACKAGE_REF='; do
+        if ! grep -Fq "$expected" "$PROJECT_DIR/build-and-copy.sh"; then
+            fail "build-and-copy.sh is missing generic B12X variable: $expected"
+        fi
+    done
+    pass "B12X preset variables use generic EXP_B12X names"
+}
+
+test_exp_b12x_supports_sm120_arches() {
+    local arch
+    for arch in 12.0a 12.0f; do
+        setup_fixture
+        run_build --exp-b12x --gpu-arch "$arch" || \
+            fail "--exp-b12x --gpu-arch $arch run failed"
+        assert_log_contains "^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg FLASHINFER_REF=main"
+        assert_log_contains "^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg NCCL_NVCC_GENCODE=-gencode=arch=compute_120,code=sm_120 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1"
+        assert_log_contains "^docker build -t vllm-node-b12x .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} "
+        assert_output_contains "Rebuilding FlashInfer wheels for GPU architecture ${arch}\.\.\."
+    done
+    pass "--exp-b12x preserves explicit SM120 architecture selections"
+}
+
+test_exp_b12x_rebuilds_mismatched_cached_flashinfer_arch() {
+    setup_fixture
+    printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/.flashinfer-arch"
+    run_build --exp-b12x --rebuild-vllm || fail "--exp-b12x cached-arch run failed"
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a '
+    assert_output_contains 'Rebuilding FlashInfer wheels for GPU architecture 12\.1a\.\.\.'
+    pass "--exp-b12x does not reuse a FlashInfer wheel for another architecture"
+}
+
+test_exp_b12x_rebuilds_mismatched_cached_vllm_arch() {
+    setup_fixture
+    printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/vllm/b12x/.vllm-arch"
+    run_build --exp-b12x --rebuild-flashinfer || fail "--exp-b12x mismatched vLLM arch run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a '
+    assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset\)\.\.\.'
+    pass "--exp-b12x does not reuse a vLLM wheel for another architecture"
+}
+
+test_dockerfile_preserves_selected_sm12x_target() {
+    local sm12x_block="$TMP_BASE/sm12x-block"
+
+    sed -n '/# CUDA 13 vLLM builds normally collapse/,/# TEMPORARY PATCH: vLLM PR #47914/p' \
+        "$PROJECT_DIR/Dockerfile" > "$sm12x_block"
+    for expected in \
+        'VLLM_PRESERVE_SM12X_TARGET="${VLLM_PRESERVE_SM12X_TARGET}"' \
+        '"7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0;12.1"' \
+        'Enabled selected SM12x target preservation for CUDA 13 vLLM build'; do
+        if ! grep -Fq "$expected" "$sm12x_block"; then
+            fail "Dockerfile SM12x build guard is missing: $expected"
+        fi
+    done
+    pass "B12X preserves the selected SM12x target under CUDA 13"
+}
+
+test_custom_torch_versions_are_forwarded() {
+    setup_fixture
+    run_build \
+        --vllm-repo https://github.com/local-inference-lab/vllm.git \
+        --vllm-ref dev/fathomless-firmament \
+        --torch-version 2.12.0 \
+        --torchvision-version 0.27.0 \
+        --torchaudio-version none || fail "custom Torch version run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_VERSION=2.12.0 --build-arg TORCHVISION_VERSION=0.27.0 --build-arg TORCHAUDIO_VERSION=none .*--build-arg VLLM_REF=dev/fathomless-firmament --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm.git'
+    assert_log_contains '^docker build -t vllm-node .*--build-arg TORCH_VERSION=2.12.0 --build-arg TORCHVISION_VERSION=0.27.0 --build-arg TORCHAUDIO_VERSION=none .*--build-arg SPARKINFER_REPO=https://github.com/lukealonso/b12x.git --build-arg SPARKINFER_REF=master '
+    assert_log_contains '.*--build-arg SPARKINFER_CACHEBUST=[0-9]+'
+    assert_output_contains 'Building SparkInfer from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/local-inference-lab/vllm ref dev/fathomless-firmament\.'
+    pass "Torch versions and the SparkInfer source checkout are forwarded to the fork build"
+}
+
+test_local_inference_lab_b12x_applies_to_any_ref() {
+    setup_fixture
+    run_build \
+        --vllm-repo https://github.com/local-inference-lab/vllm \
+        --vllm-ref dev/spark-fixes-7-14 \
+        --torch-version 2.12.0 || fail "local-inference-lab alternate ref run failed"
+    assert_log_contains '^docker build -t vllm-node .*--build-arg TORCH_VERSION=2.12.0 .*--build-arg SPARKINFER_REPO=https://github.com/lukealonso/b12x.git --build-arg SPARKINFER_REF=master '
+    assert_output_contains 'Building SparkInfer from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/local-inference-lab/vllm ref dev/spark-fixes-7-14\.'
+    pass "all local-inference-lab/vllm refs include the SparkInfer source build"
+}
+
+test_local_inference_lab_b12x_requires_torch_212() {
+    setup_fixture
+    if run_build \
+        --vllm-repo https://github.com/local-inference-lab/vllm.git \
+        --vllm-ref dev/spark-fixes-7-14; then
+        fail "local-inference-lab B12X build unexpectedly accepted the default Torch 2.11"
+    fi
+    assert_log_not_contains '^docker build'
+    assert_output_contains 'Error: https://github\.com/local-inference-lab/vllm requires --torch-version 2\.12\.0 or newer for SparkInfer \(got 2\.11\.0\)\.'
+    pass "local-inference-lab SparkInfer builds reject Torch versions older than 2.12"
+}
+
+test_dockerfile_custom_repo_bypasses_shared_cache() {
+    for expected in \
+        'Custom vLLM repository selected; bypassing shared checkout cache.' \
+        'git clone --recursive "$VLLM_REPO" /tmp/vllm-custom' \
+        'cp -a /tmp/vllm-custom "$VLLM_BASE_DIR/vllm"'; do
+        if ! grep -Fq "$expected" "$PROJECT_DIR/Dockerfile"; then
+            fail "Dockerfile custom repository block is missing: $expected"
+        fi
+    done
+    pass "custom vLLM repositories bypass the shared upstream checkout cache"
+}
+
+test_dockerfile_uses_configurable_torch_versions() {
+    if [ "$(grep -Fc 'set -- "torch==$TORCH_VERSION" "$TORCHVISION_SPEC"' "$PROJECT_DIR/Dockerfile")" -ne 2 ] || \
+       [ "$(grep -Fc 'uv pip install "$@" triton' "$PROJECT_DIR/Dockerfile")" -ne 2 ]; then
+        fail "Dockerfile does not use configurable Torch package specs in both build and runner stages"
+    fi
+    if [ "$(grep -Fc 'echo "torchvision==${PINNED_TORCHVISION}"' "$PROJECT_DIR/Dockerfile")" -ne 2 ] || \
+       [ "$(grep -Fc 'echo "torchaudio==${PINNED_TORCHAUDIO}"' "$PROJECT_DIR/Dockerfile")" -ne 2 ]; then
+        fail "Dockerfile does not preserve the selected Torch-family versions during later installs"
+    fi
+    pass "Dockerfile uses configurable Torch package versions in build and runner stages"
+}
+
+test_dockerfile_uses_profiled_named_wheel_contexts() {
+    for expected in \
+        'from=flashinfer_wheels,target=/workspace/flashinfer-wheels' \
+        'from=vllm_wheels,target=/workspace/vllm-wheels' \
+        '/workspace/flashinfer-wheels/*.whl /workspace/vllm-wheels/*.whl' \
+        'printf '\''%s\n'\'' "$TORCH_CUDA_ARCH_LIST" > /workspace/wheels/.vllm-arch'; do
+        if ! grep -Fq "$expected" "$PROJECT_DIR/Dockerfile"; then
+            fail "Dockerfile named wheel context support is missing: $expected"
+        fi
+    done
+    if grep -Fq 'source=wheels,target=/workspace/wheels' "$PROJECT_DIR/Dockerfile"; then
+        fail "Dockerfile still mounts the legacy combined wheel context"
+    fi
+    pass "Dockerfile mounts independent profiled wheel contexts"
+}
+
+test_dockerfile_builds_and_verifies_sparkinfer_source() {
+    for expected in \
+        'git clone --depth 1 --branch "$SPARKINFER_REF" "$SPARKINFER_REPO" /tmp/sparkinfer-source' \
+        'Refreshing SparkInfer source (cache key: $SPARKINFER_CACHEBUST)' \
+        'uv pip install --reinstall --no-deps /tmp/sparkinfer-source' \
+        "import sparkinfer; print('Verified SparkInfer'" \
+        "m.version('sparkinfer')" \
+        '/workspace/sparkinfer-source-commit' \
+        "m.version('nvidia-cutlass-dsl')"; do
+        if ! grep -Fq "$expected" "$PROJECT_DIR/Dockerfile"; then
+            fail "Dockerfile SparkInfer source build is missing: $expected"
+        fi
+    done
+    if grep -Fq 'sparkinfer==' "$PROJECT_DIR/Dockerfile"; then
+        fail "Dockerfile installs SparkInfer from a package index instead of source"
+    fi
+    if grep -Eq "import b12x|m\.version\('b12x'\)" "$PROJECT_DIR/Dockerfile"; then
+        fail "Dockerfile still verifies the retired b12x package name"
+    fi
+    pass "Dockerfile builds SparkInfer from source without replacing vLLM dependencies"
 }
 
 test_copied_vllm_git_index_is_refreshed_before_patch_apply() {
@@ -450,11 +816,40 @@ test_dockerfile_applies_flashinfer_prs_without_merging_branch_history() {
     pass "FlashInfer PRs apply as patches without merging branch history"
 }
 
+test_dockerfiles_pin_tvm_ffi_regression_version() {
+    if [ "$(grep -Fc 'apache-tvm-ffi==0.1.12' "$PROJECT_DIR/Dockerfile")" -ne 2 ] || \
+       [ "$(grep -Fc 'apache-tvm-ffi==0.1.12' "$PROJECT_DIR/Dockerfile.mxfp4")" -ne 1 ]; then
+        fail "Dockerfiles do not pin every TVM-FFI install to the known-good 0.1.12 release"
+    fi
+    pass "Dockerfiles pin TVM-FFI to the known-good 0.1.12 release"
+}
+
+test_dockerfile_fetches_vllm_prs_from_upstream() {
+    local vllm_pr_block="$TMP_BASE/vllm-pr-block"
+
+    sed -n '/ARG VLLM_PRS=""/,/# TEMPORARY PATCH: vLLM PR/p' "$PROJECT_DIR/Dockerfile" > "$vllm_pr_block"
+    for expected in \
+        'git remote add vllm-upstream "$VLLM_UPSTREAM_REPO"' \
+        'git fetch vllm-upstream +pull/${pr}/head:pr-${pr}' \
+        'git merge-base vllm-upstream/main pr-${pr}'; do
+        if ! grep -Fq "$expected" "$vllm_pr_block"; then
+            fail "vLLM PR block does not use the dedicated upstream remote: $expected"
+        fi
+    done
+    pass "vLLM PR patches are fetched from upstream when building a fork"
+}
+
 test_default_uses_prebuilt
 test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
 test_default_gpu_arch_stays_prebuilt
 test_non_default_gpu_arch_uses_wheel_build
+test_default_prebuilt_ignores_local_flashinfer_arch
+test_regular_build_rebuilds_mismatched_cached_flashinfer_arch
+test_regular_build_reuses_matching_cached_flashinfer_arch
+test_use_wheels_rejects_mismatched_flashinfer_arch
+test_use_wheels_rejects_mismatched_vllm_arch
+test_use_wheels_non_default_empty_cache_skips_downloads
 test_use_wheels_uses_wheel_build
 test_use_wheels_never_falls_back_to_source
 test_use_wheels_never_builds_missing_vllm_implicitly
@@ -475,7 +870,28 @@ test_apply_vllm_pr_can_apply_preset_prs_explicitly
 test_vllm_ref_can_apply_preset_prs_explicitly
 test_apply_preset_prs_forces_vllm_rebuild
 test_requested_vllm_prs_apply_to_selected_vllm_ref
+test_custom_vllm_repo_forces_source_build
+test_exp_b12x_uses_prebuilt_image
+test_exp_b12x_rebuild_vllm_uses_preset_source_build
+test_exp_b12x_allows_vllm_prs
+test_exp_b12x_respects_custom_tag
+test_exp_b12x_rejects_use_wheels
+test_exp_b12x_rejects_preset_overrides
+test_exp_b12x_variable_names_are_generic
+test_exp_b12x_supports_sm120_arches
+test_exp_b12x_rebuilds_mismatched_cached_flashinfer_arch
+test_exp_b12x_rebuilds_mismatched_cached_vllm_arch
+test_dockerfile_preserves_selected_sm12x_target
+test_custom_torch_versions_are_forwarded
+test_local_inference_lab_b12x_applies_to_any_ref
+test_local_inference_lab_b12x_requires_torch_212
+test_dockerfile_custom_repo_bypasses_shared_cache
+test_dockerfile_uses_configurable_torch_versions
+test_dockerfile_uses_profiled_named_wheel_contexts
+test_dockerfile_builds_and_verifies_sparkinfer_source
 test_copied_vllm_git_index_is_refreshed_before_patch_apply
 test_dockerfile_applies_flashinfer_prs_without_merging_branch_history
+test_dockerfiles_pin_tvm_ffi_regression_version
+test_dockerfile_fetches_vllm_prs_from_upstream
 
 echo "Passed $TESTS_PASSED build-and-copy tests."

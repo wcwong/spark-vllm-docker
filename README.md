@@ -29,7 +29,10 @@ This repository is not affiliated with NVIDIA or their subsidiaries. This is a c
 By default, `build-and-copy.sh` pulls the tested nightly runner image from DockerHub: `eugr/spark-vllm:latest`. Nightly images are built and tested on multiple models in both cluster and solo configuration before `latest` is advanced.
 We will expand the selection of models we test in the pipeline, but since vLLM is a rapidly developing platform, some things may break.
 
-If you want to build only the runner from precompiled vLLM and FlashInfer wheels, specify `--use-wheels`. This option never falls back to compiling missing wheels: if a wheel cannot be downloaded or found locally, the command stops with an error. To build the latest vLLM from the main branch, use `--rebuild-vllm`; to target a specific vLLM release or commit, set `--vllm-ref`.
+Selecting `--exp-b12x` without local-build flags or customizations pulls the separately tested
+`eugr/spark-vllm-b12x:latest` image and tags it as `vllm-node-b12x`.
+
+If you want to build only the runner from precompiled vLLM and FlashInfer wheels, specify `--use-wheels`. This option never falls back to compiling missing wheels: if a wheel cannot be downloaded or found locally, the command stops with an error. To build the latest vLLM from the main branch, use `--rebuild-vllm`; to target a specific repository, release, or commit, set `--vllm-repo` and/or `--vllm-ref`.
 
 Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-pr` control the FlashInfer build and force the local build path.
 
@@ -146,6 +149,32 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-08-03
+
+#### New B12x/SparkInfer image
+
+Added `--exp-b12x` (alias: `--experimental-b12x`) as an alternative version built from [a fork by Luke Alonso](https://github.com/local-inference-lab/vllm/tree/dev/gilded-gnosis). This fork supports a collection of experimental high-performance B12X kernels for sm12x architecture. 
+
+Since it is built from a forked vLLM branch, it will be supported in parallel to the main ("regular") build, at least for the time being.
+
+Specifying `--exp-b12x` without arguments wil pull `eugr/spark-vllm-b12x:latest` from Dockerhub, which is now built and tested together with the main image by CI pipeline on nightly basis (if there are any updates to the source branch or sparkinfer). 
+
+Add `--rebuild-vllm` to compile from the source. 
+
+The preset defaults the image tag to `vllm-node-b12x`; an explicit `-t` still takes precedence. Additional vLLM changes can be layered onto the preset with one or more `--apply-vllm-pr` flags. PRs are applied from the upstream vLLM repository, not from Luke's fork! If any PRs are specified, the script will build from the source, not prebuilt images.
+
+vLLM wheels are not published for this build, but it will reuse published Flashinfer wheels if you build from the source (unless `--rebuild-flashinfer` is specified).
+
+For now, we have only one recipe using this build, with more to come.
+
+#### DeepSeek V4 Flash 0731 B12X cluster recipe
+
+Added the cluster-only `deepseek-v4-flash-0731` recipe for serving `deepseek-ai/DeepSeek-V4-Flash-0731` on a dual DGX Spark cluster. The recipe requires B12X container (vllm-node-b12x) that can be pulled by using `./build-and-copy.sh --exp-b12x -c` (or just allow the recipe system to pull it for you). See details on b12x build above.
+
+```bash
+./run-recipe.sh deepseek-v4-flash-0731
+```
+
 ### 2026-07-30
 
 #### Inkling Small NVFP4 support
@@ -160,7 +189,7 @@ Added the support for
 Add `--setup` on the first run to prepare the container and download and
 distribute the model.
 
-#### Official vLLM earlyoom, InstantTensor, and SciPy support
+#### Official vLLM image support with earlyoom, InstantTensor, and SciPy
 
 `mods/use-official-vllm` now installs `earlyoom`, InstantTensor, and SciPy in
 addition to the compatibility packages needed by other mods. This makes
@@ -179,6 +208,16 @@ resolution.
   -v "$PWD/models:/models" \
   exec vllm serve /models/qwen3.6-35b-a4b-nvfp4 ...
 ```
+
+### 2026-07-14
+
+#### Custom vLLM repositories and PyTorch versions
+
+`build-and-copy.sh` can now build vLLM from a fork with `--vllm-repo`. Custom repositories bypass the shared upstream Git checkout cache, force a vLLM source build, and suppress the Dockerfile's upstream preset PRs unless `--apply-preset-vllm-prs` is explicitly requested.
+
+`--torch-version`, `--torchvision-version`, and `--torchaudio-version` select the packages installed in both the source-build environment and final runner image. The torchvision and torchaudio versions remain resolver-selected when their flags are omitted; `--torchaudio-version none` omits torchaudio when a matching wheel is unavailable.
+
+Builds from any ref in `local-inference-lab/vllm` also clone and build the `master` ref of `lukealonso/b12x` automatically. The repository now produces the `sparkinfer` distribution (formerly `b12x`). The source layer is refreshed on every applicable runner build so a previously cached clone cannot hide newer upstream commits. Only the locally built SparkInfer wheel is installed: its shared dependencies come from vLLM so API-sensitive pins such as CUTLASS DSL are not upgraded out from under the selected vLLM revision. The checked-out commit is recorded at `/workspace/sparkinfer-source-commit` in the image. SparkInfer kernels remain JIT-compiled at runtime; building its Python wheel does not add another CUDA compilation phase to the image build.
 
 ### 2026-07-10
 
@@ -815,7 +854,7 @@ The download logic:
 
 No new flags are required - the download happens transparently unless `--rebuild-flashinfer` is specified.
 
-All wheels (downloaded or built locally) are cached in the `./wheels` directory for subsequent reuse.
+Wheels are cached by component and profile under `./.wheel-cache` for subsequent reuse.
 
 - `--rebuild-flashinfer` will force FlashInfer rebuild from the flashinfer `main` branch.
 - `--rebuild-vllm` will force vLLM rebuild from vLLM `main` branch or specific commit in `--vllm-ref`.
@@ -1326,6 +1365,64 @@ Using a different username:
 ./build-and-copy.sh --gpu-arch 12.0f
 ```
 
+**Build a vLLM fork with custom PyTorch versions:**
+
+```bash
+./build-and-copy.sh \
+  --vllm-repo https://github.com/local-inference-lab/vllm.git \
+  --vllm-ref dev/fathomless-firmament \
+  --torch-version 2.12.0 \
+  --torchvision-version 0.27.0 \
+  --torchaudio-version none
+```
+
+For the maintained experimental B12X combination, the equivalent shortcut is:
+
+```bash
+./build-and-copy.sh --exp-b12x
+```
+
+Without local-build flags, this pulls `eugr/spark-vllm-b12x:latest` and tags it
+as `vllm-node-b12x` unless `-t` is supplied. To build the maintained combination
+from `local-inference-lab/vllm@dev/gilded-gnosis` and the `master` branch of the
+B12X/SparkInfer repository, run:
+
+```bash
+./build-and-copy.sh --exp-b12x --rebuild-vllm
+```
+
+It can be combined with `--apply-vllm-pr <pr-num>` to build custom vLLM patches.
+The preset preserves the selected SM12x target in vLLM's CUDA 13 CMake
+configuration. It defaults to `12.1a`; the B12X branch's NVFP4 MLA cache
+writer cannot compile if that target is reduced to generic `sm_120`. Explicit
+`--gpu-arch 12.0a` and `--gpu-arch 12.0f` selections remain supported and are
+forwarded unchanged rather than being forced to SM121a. FlashInfer architecture
+validation applies to every standard-Dockerfile build, including B12X: alternate
+targets rebuild FlashInfer when no matching architecture marker is present, and
+the cached wheel records its architecture so a later build cannot silently reuse
+a wheel for a different target.
+
+Custom vLLM repositories are cloned fresh instead of using the shared upstream checkout cache. Specifying a custom repository forces a vLLM source build. Upstream preset PRs are skipped by default for custom repositories and refs.
+
+Wheel profiles are selected automatically:
+
+```text
+.wheel-cache/
+├── flashinfer/
+│   ├── regular/   # shared by regular and B12X builds
+│   └── custom/    # custom ref/PR or non-default GPU target
+└── vllm/
+    ├── regular/
+    ├── b12x/
+    └── custom/    # custom repository/ref/PR, Torch family, or GPU target
+```
+
+Only regular vLLM wheels are downloaded from the published wheel release.
+`--exp-b12x` is therefore incompatible with `--use-wheels`: use bare
+`--exp-b12x` for the published image or add `--rebuild-vllm` for a source build.
+
+For any branch, tag, or commit selected from `local-inference-lab/vllm`, the runner freshly clones the `master` ref of `https://github.com/lukealonso/b12x.git`, builds and installs its `sparkinfer` distribution automatically. A per-build cache key prevents Docker from reusing a stale source checkout. The install uses `--no-deps` to preserve the dependency versions selected by vLLM, including its CUTLASS DSL pin, and records the exact source commit at `/workspace/sparkinfer-source-commit`. SparkInfer requires PyTorch 2.12 or newer.
+
 **Copy existing image without rebuilding:**
 
 ```bash
@@ -1336,21 +1433,26 @@ Using a different username:
 
 | Flag | Description |
 | :--- | :--- |
-| `-t, --tag <tag>` | Local image tag (default: `vllm-node`; auto-set to `vllm-node-tf5` with `--tf5`, `vllm-node-mxfp4` with `--exp-mxfp4`) |
-| `--use-wheels` | Build only the runner image from downloaded or local precompiled wheels; never implicitly compile missing wheels |
-| `--gpu-arch <arch>` | Target GPU architecture for wheel/source builds. The default `12.1a` still uses the prebuilt image unless another build-forcing flag is set. |
+| `-t, --tag <tag>` | Local image tag (default: `vllm-node`; auto-set to `vllm-node-tf5` with `--tf5`, `vllm-node-mxfp4` with `--exp-mxfp4`, or `vllm-node-b12x` with `--exp-b12x`) |
+| `--use-wheels` | Build only the runner image from downloaded or local precompiled wheels; never implicitly compile missing wheels. Incompatible with `--exp-b12x`. |
+| `--gpu-arch <arch>` | Target GPU architecture for wheel/source builds. Non-default targets rebuild FlashInfer unless the local cache is marked for that architecture. The default `12.1a` still uses the prebuilt image unless another build-forcing flag is set. |
 | `--rebuild-flashinfer` | Skip prebuilt wheel download; force a fresh local FlashInfer build |
 | `--rebuild-vllm` | Force rebuild vLLM from source |
 | `--force-flashinfer-download` | Force download FlashInfer wheels, skipping cached wheel checks |
 | `--force-vllm-download` | Force download vLLM wheels, skipping cached wheel checks |
 | `--force-download` | Force download all prebuilt wheels, skipping cached wheel checks |
+| `--vllm-repo <url>` | vLLM Git repository. Defaults to `https://github.com/vllm-project/vllm.git`; custom repositories bypass the shared checkout cache and force a source build. |
 | `--vllm-ref <ref>` | vLLM commit SHA, branch or tag (default: `main`) |
+| `--torch-version <version>` | PyTorch version installed in source-build and runner stages (default: `2.11.0`) |
+| `--torchvision-version <version>` | Optional torchvision version; compatible version is resolver-selected when omitted |
+| `--torchaudio-version <version>` | Optional torchaudio version; compatible version is resolver-selected when omitted. Use `none` to omit torchaudio. |
 | `--flashinfer-ref <ref>` | FlashInfer commit SHA, branch or tag (default: `main`) |
 | `--apply-vllm-pr <pr-num>` | Apply a vLLM PR patch during build. Can be specified multiple times. |
-| `--apply-preset-vllm-prs` | Apply preset vLLM PRs even when `--vllm-ref` or `--apply-vllm-pr` would otherwise suppress them |
+| `--apply-preset-vllm-prs` | Apply preset vLLM PRs even when `--vllm-repo`, `--vllm-ref`, or `--apply-vllm-pr` would otherwise suppress them |
 | `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
 | `--tf5` | Deprecated compatibility flag; pulls/tags the prebuilt image as `vllm-node-tf5` unless another build-forcing flag is set. Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
+| `--exp-b12x` | Select the B12X profile. Pulls `eugr/spark-vllm-b12x:latest` unless a local wheel/image build is requested; defaults to local tag `vllm-node-b12x`. Alias: `--experimental-b12x`. |
 | `-c, --copy-to <hosts>` | Host(s) to copy the image to after preparation (space- or comma-separated). Hosts with the same image ID are skipped. |
 | `--copy-to-host` | Alias for `--copy-to` (backwards compatibility). |
 | `--copy-parallel` | Copy to all specified hosts concurrently. |
@@ -1359,7 +1461,7 @@ Using a different username:
 | `--full-log` | Enable full Docker build output (`--progress=plain`) |
 | `--no-build` | Skip image preparation entirely, only copy an existing local image tag (requires `--copy-to`) |
 | `--network <name>` | Docker network to use during build (e.g. `host`). |
-| `--cleanup` | Remove all cached `.whl` and `*-commit` files from the `wheels/` directory; this does not force a local build by itself. |
+| `--cleanup` | Remove cached wheel files and provenance markers from every `.wheel-cache` profile; this does not force a local build by itself. |
 | `--config <file>` | Path to `.env` configuration file (default: `.env` in script directory) |
 | `--setup` | Force autodiscovery and save configuration to `.env` (even if `.env` already exists) |
 | `-h, --help` | Show help message |
@@ -1664,6 +1766,7 @@ The repository includes several pre-configured mods in the `mods/` directory:
 - **fix-qwen3.5-chat-template/** and **fix-qwen3.6-chat-template/**: Install fixed chat templates used by the Qwen3.5 and Qwen3.6 recipes.
 - **fix-qwen3.5-autoround/**, **fix-qwen3-next-autoround/**, and **fix-qwen35-tp4-marlin/**: Model-specific Qwen AutoRound and Marlin compatibility fixes.
 - **fix-qwen3-coder-next/**: Qwen3-Coder-Next runtime and performance fixes.
+- **dspark-instanttensor/**: Filters embedded `mtp.*` DSpark draft weights before InstantTensor or safetensors I/O, preventing a second full-checkpoint load.
 - **gpu-mem-util-gb/**: Adds experimental `--gpu-memory-utilization-gb` support.
 - **kv-cache-prealloc-cleanup/**: Applies model-specific manual KV-cache startup tweaks: skip CUDA graph profiling when disabled by env and allow `--gpu-memory-utilization-gb` with `--kv-cache-memory-bytes`.
 - **uma-fix/**: Uses CUDA/NVML memory accounting under WSL and skips host-memory UMA accounting there.
