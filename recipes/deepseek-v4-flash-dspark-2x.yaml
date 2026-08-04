@@ -34,17 +34,15 @@ defaults:
 env:
   CUDA_SCALE_LAUNCH_QUEUES: "4x"
   CUTE_DSL_ARCH: "sm_121a"
-
   OMP_NUM_THREADS: "10"
   MKL_NUM_THREADS: "10"
-
-#  VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: "trtllm::fused_moe::gemm1,trtllm::fused_moe::gemm2"
   VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: "1"
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
+#  VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: "trtllm::fused_moe::gemm1,trtllm::fused_moe::gemm2"
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
   VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
-  VLLM_LOGGING_LEVEL: "DEBUG"
+#  VLLM_LOGGING_LEVEL: "DEBUG"
 
 mods:
   - mods/drop-caches
